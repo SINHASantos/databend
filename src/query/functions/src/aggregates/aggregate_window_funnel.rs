@@ -19,32 +19,32 @@ use std::marker::PhantomData;
 use std::ops::Sub;
 use std::sync::Arc;
 
-use common_arrow::arrow::bitmap::Bitmap;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::type_check::check_number;
-use common_expression::types::number::Number;
-use common_expression::types::number::UInt8Type;
-use common_expression::types::ArgType;
-use common_expression::types::BooleanType;
-use common_expression::types::DataType;
-use common_expression::types::DateType;
-use common_expression::types::NumberDataType;
-use common_expression::types::NumberType;
-use common_expression::types::TimestampType;
-use common_expression::types::ValueType;
-use common_expression::with_integer_mapped_type;
-use common_expression::Column;
-use common_expression::ColumnBuilder;
-use common_expression::Expr;
-use common_expression::FunctionContext;
-use common_expression::Scalar;
-use common_io::prelude::*;
+use borsh::BorshDeserialize;
+use borsh::BorshSerialize;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::type_check::check_number;
+use databend_common_expression::types::number::Number;
+use databend_common_expression::types::number::UInt8Type;
+use databend_common_expression::types::ArgType;
+use databend_common_expression::types::Bitmap;
+use databend_common_expression::types::BooleanType;
+use databend_common_expression::types::DataType;
+use databend_common_expression::types::DateType;
+use databend_common_expression::types::NumberDataType;
+use databend_common_expression::types::NumberType;
+use databend_common_expression::types::TimestampType;
+use databend_common_expression::types::ValueType;
+use databend_common_expression::with_integer_mapped_type;
+use databend_common_expression::ColumnBuilder;
+use databend_common_expression::Expr;
+use databend_common_expression::FunctionContext;
+use databend_common_expression::InputColumns;
+use databend_common_expression::Scalar;
 use num_traits::AsPrimitive;
-use serde::de::DeserializeOwned;
-use serde::Deserialize;
-use serde::Serialize;
 
+use super::borsh_deserialize_state;
+use super::borsh_serialize_state;
 use super::AggregateFunctionRef;
 use super::AggregateNullVariadicAdaptor;
 use super::StateAddr;
@@ -54,9 +54,8 @@ use crate::aggregates::assert_variadic_arguments;
 use crate::aggregates::AggregateFunction;
 use crate::BUILTIN_FUNCTIONS;
 
-#[derive(Serialize, Deserialize)]
+#[derive(BorshSerialize, BorshDeserialize)]
 struct AggregateWindowFunnelState<T> {
-    #[serde(bound(deserialize = "T: DeserializeOwned"))]
     pub events_list: Vec<(T, u8)>,
     pub sorted: bool,
 }
@@ -65,8 +64,8 @@ impl<T> AggregateWindowFunnelState<T>
 where T: Ord
         + Sub<Output = T>
         + AsPrimitive<u64>
-        + Serialize
-        + DeserializeOwned
+        + BorshSerialize
+        + BorshDeserialize
         + Clone
         + Send
         + Sync
@@ -147,16 +146,6 @@ where T: Ord
             self.events_list.sort_by(cmp);
         }
     }
-
-    fn serialize(&self, writer: &mut Vec<u8>) -> Result<()> {
-        serialize_into_buf(writer, self)
-    }
-
-    fn deserialize(&mut self, reader: &mut &[u8]) -> Result<()> {
-        *self = deserialize_from_slice(reader)?;
-
-        Ok(())
-    }
 }
 
 #[derive(Clone)]
@@ -176,8 +165,8 @@ where
         + Sub<Output = T::Scalar>
         + AsPrimitive<u64>
         + Clone
-        + Serialize
-        + DeserializeOwned
+        + BorshSerialize
+        + BorshDeserialize
         + 'static,
 {
     fn name(&self) -> &str {
@@ -199,7 +188,7 @@ where
     fn accumulate(
         &self,
         place: StateAddr,
-        columns: &[Column],
+        columns: InputColumns,
         validity: Option<&Bitmap>,
         _input_rows: usize,
     ) -> Result<()> {
@@ -247,7 +236,7 @@ where
         &self,
         places: &[StateAddr],
         offset: usize,
-        columns: &[Column],
+        columns: InputColumns,
         _input_rows: usize,
     ) -> Result<()> {
         let mut dcolumns = Vec::with_capacity(self.event_size);
@@ -270,7 +259,7 @@ where
         Ok(())
     }
 
-    fn accumulate_row(&self, place: StateAddr, columns: &[Column], row: usize) -> Result<()> {
+    fn accumulate_row(&self, place: StateAddr, columns: InputColumns, row: usize) -> Result<()> {
         let tcolumn = T::try_downcast_column(&columns[0]).unwrap();
         let timestamp = unsafe { T::index_column_unchecked(&tcolumn, row) };
         let timestamp = T::to_owned_scalar(timestamp);
@@ -287,19 +276,20 @@ where
 
     fn serialize(&self, place: StateAddr, writer: &mut Vec<u8>) -> Result<()> {
         let state = place.get::<AggregateWindowFunnelState<T::Scalar>>();
-        AggregateWindowFunnelState::<T::Scalar>::serialize(state, writer)
+        borsh_serialize_state(writer, state)
     }
 
-    fn deserialize(&self, place: StateAddr, reader: &mut &[u8]) -> Result<()> {
+    fn merge(&self, place: StateAddr, reader: &mut &[u8]) -> Result<()> {
         let state = place.get::<AggregateWindowFunnelState<T::Scalar>>();
-        state.deserialize(reader)
+        let mut rhs: AggregateWindowFunnelState<T::Scalar> = borsh_deserialize_state(reader)?;
+        state.merge(&mut rhs);
+        Ok(())
     }
 
-    fn merge(&self, place: StateAddr, rhs: StateAddr) -> Result<()> {
-        let rhs = rhs.get::<AggregateWindowFunnelState<T::Scalar>>();
+    fn merge_states(&self, place: StateAddr, rhs: StateAddr) -> Result<()> {
         let state = place.get::<AggregateWindowFunnelState<T::Scalar>>();
-
-        state.merge(rhs);
+        let other = rhs.get::<AggregateWindowFunnelState<T::Scalar>>();
+        state.merge(other);
         Ok(())
     }
 
@@ -346,8 +336,8 @@ where
         + Sub<Output = T::Scalar>
         + AsPrimitive<u64>
         + Clone
-        + Serialize
-        + DeserializeOwned
+        + BorshSerialize
+        + BorshDeserialize
         + 'static,
 {
     pub fn try_create(
@@ -356,18 +346,13 @@ where
         arguments: Vec<DataType>,
     ) -> Result<AggregateFunctionRef> {
         let event_size = arguments.len() - 1;
-        let window = check_number(
+        let window = check_number::<_, u64>(
             None,
             &FunctionContext::default(),
-            &Expr::<usize>::Cast {
+            &Expr::<usize>::Constant {
                 span: None,
-                is_try: false,
-                expr: Box::new(Expr::Constant {
-                    span: None,
-                    scalar: params[0].clone(),
-                    data_type: params[0].as_ref().infer_data_type(),
-                }),
-                dest_type: DataType::Number(NumberDataType::UInt64),
+                scalar: params[0].clone(),
+                data_type: params[0].as_ref().infer_data_type(),
             },
             &BUILTIN_FUNCTIONS,
         )?;

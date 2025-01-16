@@ -20,7 +20,7 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 
 use bumpalo::Bump;
-use common_base::mem_allocator::MmapAllocator;
+use databend_common_base::mem_allocator::MmapAllocator;
 
 use crate::container::Container;
 use crate::container::HeapContainer;
@@ -46,9 +46,11 @@ impl PartialEq for DictionaryKeys {
 }
 
 impl FastHash for DictionaryKeys {
+    #[inline(always)]
     fn fast_hash(&self) -> u64 {
         unsafe {
-            self.keys
+            let hash = self
+                .keys
                 .as_ref()
                 .iter()
                 .map(|x| x.as_ref().fast_hash())
@@ -59,7 +61,12 @@ impl FastHash for DictionaryKeys {
                     b ^= b >> 47;
                     b.wrapping_mul(0x9ddfea08eb382d69_u64)
                 })
-                .unwrap_or_default()
+                .unwrap_or_default();
+            if cfg!(target_feature = "sse4.2") {
+                hash >> 32
+            } else {
+                hash
+            }
         }
     }
 }
@@ -84,7 +91,10 @@ pub struct DictionaryEntry<V> {
 
 impl<V> DictionaryEntry<V> {
     pub fn is_zero(&self) -> bool {
-        unsafe { self.key.assume_init_ref().as_ptr().is_null() }
+        #[allow(useless_ptr_null_checks)]
+        unsafe {
+            self.key.assume_init_ref().as_ptr().is_null()
+        }
     }
 }
 
@@ -273,10 +283,26 @@ impl<V> DictionaryStringHashTable<V> {
 impl<V> HashtableLike for DictionaryStringHashTable<V> {
     type Key = DictionaryKeys;
     type Value = V;
-    type EntryRef<'a> = DictionaryEntryRef<'a, V> where Self: 'a, V: 'a;
-    type EntryMutRef<'a> = DictionaryMutEntryRef<'a, V> where Self: 'a, V: 'a;
-    type Iterator<'a> = DictionaryTableIter<'a, V> where Self: 'a, V: 'a;
-    type IteratorMut<'a> = DictionaryTableMutIter<'a, V> where Self: 'a, V: 'a;
+    type EntryRef<'a>
+        = DictionaryEntryRef<'a, V>
+    where
+        Self: 'a,
+        V: 'a;
+    type EntryMutRef<'a>
+        = DictionaryMutEntryRef<'a, V>
+    where
+        Self: 'a,
+        V: 'a;
+    type Iterator<'a>
+        = DictionaryTableIter<'a, V>
+    where
+        Self: 'a,
+        V: 'a;
+    type IteratorMut<'a>
+        = DictionaryTableMutIter<'a, V>
+    where
+        Self: 'a,
+        V: 'a;
 
     fn len(&self) -> usize {
         self.entries_len
@@ -444,14 +470,11 @@ impl<'a, V> Clone for DictionaryEntryRef<'a, V>
 where Self: 'a
 {
     fn clone(&self) -> Self {
-        DictionaryEntryRef {
-            key: self.key,
-            entry: self.entry,
-        }
+        *self
     }
 }
 
-impl<'a, V> Copy for DictionaryEntryRef<'a, V> {}
+impl<V> Copy for DictionaryEntryRef<'_, V> {}
 
 impl<'a, V> DictionaryEntryRef<'a, V>
 where Self: 'a
@@ -538,7 +561,7 @@ pub struct DictionaryTableIter<'a, V> {
     dict_keys: usize,
 }
 
-unsafe impl<'a, V> TrustedLen for DictionaryTableIter<'a, V> {}
+unsafe impl<V> TrustedLen for DictionaryTableIter<'_, V> {}
 
 impl<'a, V> Iterator for DictionaryTableIter<'a, V> {
     type Item = DictionaryEntryRef<'a, V>;
@@ -637,7 +660,7 @@ pub struct DictionaryTableKeySlotIter<'a, T> {
     dictionary_hashset: &'a StringHashSet<[u8]>,
 }
 
-impl<'a, T> Iterator for DictionaryTableKeySlotIter<'a, T> {
+impl<T> Iterator for DictionaryTableKeySlotIter<'_, T> {
     type Item = usize;
 
     fn next(&mut self) -> Option<Self::Item> {

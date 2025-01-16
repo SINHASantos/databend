@@ -19,26 +19,26 @@ use std::fmt::Formatter;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use common_arrow::arrow::bitmap::Bitmap;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::type_check::check_number;
-use common_expression::types::number::*;
-use common_expression::types::*;
-use common_expression::with_number_mapped_type;
-use common_expression::Column;
-use common_expression::ColumnBuilder;
-use common_expression::Expr;
-use common_expression::FunctionContext;
-use common_expression::Scalar;
-use common_expression::ScalarRef;
-use common_io::prelude::deserialize_from_slice;
-use common_io::prelude::serialize_into_buf;
+use borsh::BorshDeserialize;
+use borsh::BorshSerialize;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::type_check::check_number;
+use databend_common_expression::types::number::*;
+use databend_common_expression::types::Bitmap;
+use databend_common_expression::types::*;
+use databend_common_expression::with_number_mapped_type;
+use databend_common_expression::ColumnBuilder;
+use databend_common_expression::Expr;
+use databend_common_expression::FunctionContext;
+use databend_common_expression::InputColumns;
+use databend_common_expression::Scalar;
+use databend_common_expression::ScalarRef;
 use itertools::Itertools;
 use num_traits::AsPrimitive;
-use serde::Deserialize;
-use serde::Serialize;
 
+use super::borsh_deserialize_state;
+use super::borsh_serialize_state;
 use crate::aggregates::aggregate_function_factory::AggregateFunctionDescription;
 use crate::aggregates::assert_params;
 use crate::aggregates::assert_unary_arguments;
@@ -47,11 +47,11 @@ use crate::aggregates::AggregateFunctionRef;
 use crate::aggregates::StateAddr;
 use crate::BUILTIN_FUNCTIONS;
 
-const MEDIAN: u8 = 0;
-const QUANTILE: u8 = 1;
+pub(crate) const MEDIAN: u8 = 0;
+pub(crate) const QUANTILE: u8 = 1;
 
-#[derive(Serialize, Deserialize)]
-struct QuantileTDigestState {
+#[derive(BorshSerialize, BorshDeserialize)]
+pub(crate) struct QuantileTDigestState {
     epsilon: u32,
     max_centroids: usize,
 
@@ -67,7 +67,7 @@ struct QuantileTDigestState {
 }
 
 impl QuantileTDigestState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             epsilon: 100u32,
             max_centroids: 2048,
@@ -82,17 +82,17 @@ impl QuantileTDigestState {
         }
     }
 
-    fn add(&mut self, other: f64) {
+    pub(crate) fn add(&mut self, other: f64, weight: Option<u64>) {
         if self.unmerged_weights.len() + self.weights.len() >= self.max_centroids - 1 {
             self.compress();
         }
 
-        self.unmerged_weights.push(1f64);
+        self.unmerged_weights.push(weight.unwrap_or(1) as f64);
         self.unmerged_means.push(other);
         self.unmerged_total_weight += 1f64;
     }
 
-    fn merge(&mut self, rhs: &mut Self) -> Result<()> {
+    pub(crate) fn merge(&mut self, rhs: &mut Self) -> Result<()> {
         if rhs.len() == 0 {
             return Ok(());
         }
@@ -107,7 +107,11 @@ impl QuantileTDigestState {
         Ok(())
     }
 
-    fn merge_result(&mut self, builder: &mut ColumnBuilder, levels: Vec<f64>) -> Result<()> {
+    pub(crate) fn merge_result(
+        &mut self,
+        builder: &mut ColumnBuilder,
+        levels: Vec<f64>,
+    ) -> Result<()> {
         if levels.len() > 1 {
             let builder = match builder {
                 ColumnBuilder::Array(box b) => b,
@@ -126,7 +130,7 @@ impl QuantileTDigestState {
         Ok(())
     }
 
-    fn quantile(&mut self, level: f64) -> f64 {
+    pub(crate) fn quantile(&mut self, level: f64) -> f64 {
         self.compress();
         if self.weights.is_empty() {
             return 0f64;
@@ -284,7 +288,7 @@ pub struct AggregateQuantileTDigestFunction<T> {
 impl<T> Display for AggregateQuantileTDigestFunction<T>
 where T: Number + AsPrimitive<f64>
 {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         write!(f, "{}", self.display_name)
     }
 }
@@ -307,7 +311,7 @@ where T: Number + AsPrimitive<f64>
     fn accumulate(
         &self,
         place: StateAddr,
-        columns: &[Column],
+        columns: InputColumns,
         validity: Option<&Bitmap>,
         _input_rows: usize,
     ) -> Result<()> {
@@ -317,25 +321,25 @@ where T: Number + AsPrimitive<f64>
             Some(bitmap) => {
                 for (value, is_valid) in column.iter().zip(bitmap.iter()) {
                     if is_valid {
-                        state.add(value.as_());
+                        state.add(value.as_(), None);
                     }
                 }
             }
             None => {
                 for value in column.iter() {
-                    state.add(value.as_());
+                    state.add(value.as_(), None);
                 }
             }
         }
 
         Ok(())
     }
-    fn accumulate_row(&self, place: StateAddr, columns: &[Column], row: usize) -> Result<()> {
+    fn accumulate_row(&self, place: StateAddr, columns: InputColumns, row: usize) -> Result<()> {
         let column = NumberType::<T>::try_downcast_column(&columns[0]).unwrap();
         let v = NumberType::<T>::index_column(&column, row);
         if let Some(v) = v {
             let state = place.get::<QuantileTDigestState>();
-            state.add(v.as_())
+            state.add(v.as_(), None)
         }
         Ok(())
     }
@@ -343,33 +347,34 @@ where T: Number + AsPrimitive<f64>
         &self,
         places: &[StateAddr],
         offset: usize,
-        columns: &[Column],
+        columns: InputColumns,
         _input_rows: usize,
     ) -> Result<()> {
         let column = NumberType::<T>::try_downcast_column(&columns[0]).unwrap();
         column.iter().zip(places.iter()).for_each(|(v, place)| {
             let addr = place.next(offset);
             let state = addr.get::<QuantileTDigestState>();
-            let v = v.as_();
-            state.add(v)
+            state.add(v.as_(), None)
         });
         Ok(())
     }
     fn serialize(&self, place: StateAddr, writer: &mut Vec<u8>) -> Result<()> {
         let state = place.get::<QuantileTDigestState>();
-        serialize_into_buf(writer, state)
+        borsh_serialize_state(writer, state)
     }
-    fn deserialize(&self, place: StateAddr, reader: &mut &[u8]) -> Result<()> {
-        let state = place.get::<QuantileTDigestState>();
-        *state = deserialize_from_slice(reader)?;
 
-        Ok(())
-    }
-    fn merge(&self, place: StateAddr, rhs: StateAddr) -> Result<()> {
-        let rhs = rhs.get::<QuantileTDigestState>();
+    fn merge(&self, place: StateAddr, reader: &mut &[u8]) -> Result<()> {
         let state = place.get::<QuantileTDigestState>();
-        state.merge(rhs)
+        let mut rhs: QuantileTDigestState = borsh_deserialize_state(reader)?;
+        state.merge(&mut rhs)
     }
+
+    fn merge_states(&self, place: StateAddr, rhs: StateAddr) -> Result<()> {
+        let state = place.get::<QuantileTDigestState>();
+        let other = rhs.get::<QuantileTDigestState>();
+        state.merge(other)
+    }
+
     fn merge_result(&self, place: StateAddr, builder: &mut ColumnBuilder) -> Result<()> {
         let state = place.get::<QuantileTDigestState>();
         state.merge_result(builder, self.levels.clone())
@@ -487,7 +492,7 @@ pub fn try_create_aggregate_quantile_tdigest_function<const TYPE: u8>(
         }
 
         _ => Err(ErrorCode::BadDataValueType(format!(
-            "{} does not support type '{:?}'",
+            "{} just support numeric type, but got '{:?}'",
             display_name, arguments[0]
         ))),
     })

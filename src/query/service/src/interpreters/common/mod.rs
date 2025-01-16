@@ -12,18 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod compact_hook;
 mod grant;
 mod metrics;
-mod refresh_aggregating_index;
+mod notification;
+mod query_log;
+mod stream;
 mod table;
+mod task;
 mod util;
 
-pub use compact_hook::*;
+pub mod table_option_validation;
+
 pub use grant::validate_grant_object_exists;
-pub use refresh_aggregating_index::hook_refresh_agg_index;
-pub use refresh_aggregating_index::RefreshAggIndexDesc;
+pub use notification::get_notification_client_config;
+pub use query_log::InterpreterQueryLog;
+pub use stream::dml_build_update_stream_req;
+pub use stream::query_build_update_stream_req;
 pub use table::check_referenced_computed_columns;
+pub use task::get_task_client_config;
+pub use task::make_schedule_options;
+pub use task::make_warehouse_options;
 pub use util::check_deduplicate_label;
 
 pub use self::metrics::*;

@@ -14,44 +14,43 @@
 
 use std::sync::Arc;
 
-use common_ast::ast::Identifier;
-use common_ast::ast::ModifyColumnAction;
-use common_ast::ast::TypeName;
-use common_base::runtime::GlobalIORuntime;
-use common_catalog::catalog::Catalog;
-use common_catalog::table::Table;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::ComputedExpr;
-use common_expression::DataSchema;
-use common_expression::TableSchema;
-use common_license::license::Feature::ComputedColumn;
-use common_license::license::Feature::DataMask;
-use common_license::license_manager::get_license_manager;
-use common_meta_app::schema::DatabaseType;
-use common_meta_app::schema::SetTableColumnMaskPolicyAction;
-use common_meta_app::schema::SetTableColumnMaskPolicyReq;
-use common_meta_app::schema::TableMeta;
-use common_meta_app::schema::UpdateTableMetaReq;
-use common_meta_types::MatchSeq;
-use common_sql::executor::DistributedInsertSelect;
-use common_sql::executor::PhysicalPlan;
-use common_sql::executor::PhysicalPlanBuilder;
-use common_sql::plans::ModifyTableColumnPlan;
-use common_sql::plans::Plan;
-use common_sql::resolve_type_name;
-use common_sql::BloomIndexColumns;
-use common_sql::Planner;
-use common_storages_fuse::FuseTable;
-use common_storages_share::save_share_table_info;
-use common_storages_view::view_table::VIEW_ENGINE;
-use common_users::UserApiProvider;
-use data_mask_feature::get_datamask_handler;
-use storages_common_index::BloomIndex;
-use storages_common_table_meta::table::OPT_KEY_BLOOM_INDEX_COLUMNS;
-use table_lock::TableLockHandlerWrapper;
+use databend_common_catalog::catalog::Catalog;
+use databend_common_catalog::table::Table;
+use databend_common_catalog::table::TableExt;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::ComputedExpr;
+use databend_common_expression::DataSchema;
+use databend_common_expression::TableDataType;
+use databend_common_expression::TableField;
+use databend_common_expression::TableSchema;
+use databend_common_license::license::Feature::ComputedColumn;
+use databend_common_license::license::Feature::DataMask;
+use databend_common_license::license_manager::LicenseManagerSwitch;
+use databend_common_meta_app::schema::DatabaseType;
+use databend_common_meta_app::schema::SetTableColumnMaskPolicyAction;
+use databend_common_meta_app::schema::SetTableColumnMaskPolicyReq;
+use databend_common_meta_app::schema::TableMeta;
+use databend_common_meta_app::schema::UpdateTableMetaReq;
+use databend_common_meta_types::MatchSeq;
+use databend_common_sql::executor::physical_plans::DistributedInsertSelect;
+use databend_common_sql::executor::PhysicalPlan;
+use databend_common_sql::executor::PhysicalPlanBuilder;
+use databend_common_sql::field_default_value;
+use databend_common_sql::plans::ModifyColumnAction;
+use databend_common_sql::plans::ModifyTableColumnPlan;
+use databend_common_sql::plans::Plan;
+use databend_common_sql::BloomIndexColumns;
+use databend_common_sql::Planner;
+use databend_common_storages_fuse::FuseTable;
+use databend_common_storages_stream::stream_table::STREAM_ENGINE;
+use databend_common_storages_view::view_table::VIEW_ENGINE;
+use databend_common_users::UserApiProvider;
+use databend_enterprise_data_mask_feature::get_datamask_handler;
+use databend_storages_common_index::BloomIndex;
+use databend_storages_common_table_meta::table::OPT_KEY_BLOOM_INDEX_COLUMNS;
 
-use super::common::check_referenced_computed_columns;
+use crate::interpreters::common::check_referenced_computed_columns;
 use crate::interpreters::Interpreter;
 use crate::pipelines::PipelineBuildResult;
 use crate::schedulers::build_query_pipeline_without_render_result_set;
@@ -72,21 +71,24 @@ impl ModifyTableColumnInterpreter {
     async fn do_set_data_mask_policy(
         &self,
         catalog: Arc<dyn Catalog>,
-        table: &Arc<dyn Table>,
+        table: Arc<dyn Table>,
         column: String,
         mask_name: String,
     ) -> Result<PipelineBuildResult> {
-        let license_manager = get_license_manager();
-        license_manager.manager.check_enterprise_enabled(
-            &self.ctx.get_settings(),
-            self.ctx.get_tenant(),
-            DataMask,
-        )?;
+        LicenseManagerSwitch::instance()
+            .check_enterprise_enabled(self.ctx.get_license_key(), DataMask)?;
+
+        if table.is_temp() {
+            return Err(ErrorCode::StorageOther(format!(
+                "Table {} is temporary table, setting data mask policy not allowed",
+                table.name()
+            )));
+        }
 
         let meta_api = UserApiProvider::instance().get_meta_store_client();
         let handler = get_datamask_handler();
         let policy = handler
-            .get_data_mask(meta_api, self.ctx.get_tenant(), mask_name.clone())
+            .get_data_mask(meta_api, &self.ctx.get_tenant(), mask_name.clone())
             .await?;
 
         // check if column type match to the input type
@@ -125,64 +127,7 @@ impl ModifyTableColumnInterpreter {
             action: SetTableColumnMaskPolicyAction::Set(mask_name, prev_column_mask_name),
         };
 
-        let res = catalog.set_table_column_mask_policy(req).await?;
-
-        if let Some(share_table_info) = res.share_table_info {
-            save_share_table_info(
-                &self.ctx.get_tenant(),
-                self.ctx.get_data_operator()?.operator(),
-                share_table_info,
-            )
-            .await?;
-        }
-        Ok(PipelineBuildResult::create())
-    }
-
-    // unset data mask policy to a column is a ee feature.
-    async fn do_unset_data_mask_policy(
-        &self,
-        catalog: Arc<dyn Catalog>,
-        table: &Arc<dyn Table>,
-        column: String,
-    ) -> Result<PipelineBuildResult> {
-        let license_manager = get_license_manager();
-        license_manager.manager.check_enterprise_enabled(
-            &self.ctx.get_settings(),
-            self.ctx.get_tenant(),
-            DataMask,
-        )?;
-
-        let table_info = table.get_table_info();
-        let table_id = table_info.ident.table_id;
-        let table_version = table_info.ident.seq;
-
-        let prev_column_mask_name =
-            if let Some(column_mask_policy) = &table_info.meta.column_mask_policy {
-                column_mask_policy.get(&column).cloned()
-            } else {
-                None
-            };
-
-        if let Some(prev_column_mask_name) = prev_column_mask_name {
-            let req = SetTableColumnMaskPolicyReq {
-                tenant: self.ctx.get_tenant(),
-                seq: MatchSeq::Exact(table_version),
-                table_id,
-                column,
-                action: SetTableColumnMaskPolicyAction::Unset(prev_column_mask_name),
-            };
-
-            let res = catalog.set_table_column_mask_policy(req).await?;
-
-            if let Some(share_table_info) = res.share_table_info {
-                save_share_table_info(
-                    &self.ctx.get_tenant(),
-                    self.ctx.get_data_operator()?.operator(),
-                    share_table_info,
-                )
-                .await?;
-            }
-        }
+        let _resp = catalog.set_table_column_mask_policy(req).await?;
 
         Ok(PipelineBuildResult::create())
     }
@@ -190,21 +135,34 @@ impl ModifyTableColumnInterpreter {
     // Set data column type.
     async fn do_set_data_type(
         &self,
-        table: &Arc<dyn Table>,
-        column_name_types: &Vec<(Identifier, TypeName)>,
+        table: Arc<dyn Table>,
+        field_and_comments: &[(TableField, String)],
     ) -> Result<PipelineBuildResult> {
         let schema = table.schema().as_ref().clone();
         let table_info = table.get_table_info();
         let mut new_schema = schema.clone();
 
-        // Add table lock heartbeat.
-        let handler = TableLockHandlerWrapper::instance(self.ctx.clone());
-        let mut heartbeat = handler
-            .try_lock(self.ctx.clone(), table_info.clone())
-            .await?;
+        // first check default expr before lock table
+        for (field, _comment) in field_and_comments {
+            let column = &field.name.to_string();
+            let data_type = &field.data_type;
+            if let Some((i, _)) = schema.column_with_name(column) {
+                if let Some(default_expr) = &field.default_expr {
+                    let default_expr = default_expr.to_string();
+                    new_schema.fields[i].data_type = data_type.clone();
+                    new_schema.fields[i].default_expr = Some(default_expr);
+                    let _ = field_default_value(self.ctx.clone(), &new_schema.fields[i])?;
+                }
+            } else {
+                return Err(ErrorCode::UnknownColumn(format!(
+                    "Cannot find column {}",
+                    column
+                )));
+            }
+        }
 
-        let catalog = self.ctx.get_catalog(table_info.catalog()).await?;
-        let catalog_info = catalog.info();
+        let catalog_name = table_info.catalog();
+        let catalog = self.ctx.get_catalog(catalog_name).await?;
 
         let fuse_table = FuseTable::try_from_table(table.as_ref())?;
         let prev_snapshot_id = fuse_table
@@ -219,32 +177,52 @@ impl ModifyTableColumnInterpreter {
             }
         }
 
-        for (column, type_name) in column_name_types {
-            let column = column.to_string();
-            if let Ok(i) = schema.index_of(&column) {
-                let new_type = resolve_type_name(type_name)?;
-
-                if new_type != new_schema.fields[i].data_type {
+        let mut table_info = table.get_table_info().clone();
+        table_info.meta.fill_field_comments();
+        let mut modify_comment = false;
+        for (field, comment) in field_and_comments {
+            let column = &field.name.to_string();
+            let data_type = &field.data_type;
+            if let Some((i, old_field)) = schema.column_with_name(column) {
+                if data_type != &new_schema.fields[i].data_type {
                     // Check if this column is referenced by computed columns.
                     let mut data_schema: DataSchema = table_info.schema().into();
-                    data_schema.set_field_type(i, (&new_type).into());
+                    data_schema.set_field_type(i, data_type.into());
                     check_referenced_computed_columns(
                         self.ctx.clone(),
                         Arc::new(data_schema),
-                        &column,
+                        column,
                     )?;
 
                     // If the column is defined in bloom index columns,
                     // check whether the data type is supported for bloom index.
                     if bloom_index_cols.iter().any(|v| v.as_str() == column)
-                        && !BloomIndex::supported_type(&new_type)
+                        && !BloomIndex::supported_type(data_type)
                     {
                         return Err(ErrorCode::TableOptionInvalid(format!(
                             "Unsupported data type '{}' for bloom index",
-                            new_type
+                            data_type
                         )));
                     }
-                    new_schema.fields[i].data_type = new_type;
+                    // If the column is inverted index column, the type can't be changed.
+                    if !table_info.meta.indexes.is_empty() {
+                        for (index_name, index) in &table_info.meta.indexes {
+                            if index.column_ids.contains(&old_field.column_id)
+                                && old_field.data_type.remove_nullable()
+                                    != field.data_type.remove_nullable()
+                            {
+                                return Err(ErrorCode::ColumnReferencedByInvertedIndex(format!(
+                                    "column `{}` is referenced by inverted index, drop inverted index `{}` first",
+                                    column, index_name,
+                                )));
+                            }
+                        }
+                    }
+                    new_schema.fields[i].data_type = data_type.clone();
+                }
+                if table_info.meta.field_comments[i] != *comment {
+                    table_info.meta.field_comments[i] = comment.to_string();
+                    modify_comment = true;
                 }
             } else {
                 return Err(ErrorCode::UnknownColumn(format!(
@@ -253,8 +231,107 @@ impl ModifyTableColumnInterpreter {
                 )));
             }
         }
+
         // check if schema has changed
-        if schema == new_schema {
+        if schema == new_schema && !modify_comment {
+            return Ok(PipelineBuildResult::create());
+        }
+
+        // if schema is same and only modify comment, don't need to modify schema
+        if schema == new_schema && modify_comment {
+            let table_id = table_info.ident.table_id;
+            let table_version = table_info.ident.seq;
+
+            let req = UpdateTableMetaReq {
+                table_id,
+                seq: MatchSeq::Exact(table_version),
+                new_table_meta: table_info.meta,
+            };
+
+            let _resp = catalog
+                .update_single_table_meta(req, table.get_table_info())
+                .await?;
+
+            return Ok(PipelineBuildResult::create());
+        }
+
+        // if alter column from string to binary in parquet, we don't need to rebuild table
+        let is_alter_column_string_to_binary = table.storage_format_as_parquet()
+            && schema
+                .fields()
+                .iter()
+                .zip(new_schema.fields())
+                .all(|(old_field, new_field)| {
+                    fn is_string_to_binary(old_ty: &TableDataType, new_ty: &TableDataType) -> bool {
+                        match (old_ty, new_ty) {
+                            (TableDataType::String, TableDataType::Binary) => true,
+                            (TableDataType::Nullable(old_ty), TableDataType::Nullable(new_ty)) => {
+                                is_string_to_binary(old_ty, new_ty)
+                            }
+                            (TableDataType::Map(old_ty), TableDataType::Map(new_ty)) => {
+                                is_string_to_binary(old_ty, new_ty)
+                            }
+                            (TableDataType::Array(old_ty), TableDataType::Array(new_ty)) => {
+                                is_string_to_binary(old_ty, new_ty)
+                            }
+                            (
+                                TableDataType::Tuple {
+                                    fields_type: old_tys,
+                                    ..
+                                },
+                                TableDataType::Tuple {
+                                    fields_type: new_tys,
+                                    ..
+                                },
+                            ) => {
+                                old_tys.len() == new_tys.len()
+                                    && old_tys
+                                        .iter()
+                                        .zip(new_tys)
+                                        .all(|(old_ty, new_ty)| is_string_to_binary(old_ty, new_ty))
+                            }
+                            _ => false,
+                        }
+                    }
+
+                    let TableField {
+                        name: old_name,
+                        default_expr: old_default_expr,
+                        data_type: old_data_type,
+                        column_id: old_column_id,
+                        computed_expr: old_computed_expr,
+                    } = old_field;
+                    let TableField {
+                        name: new_name,
+                        default_expr: new_default_expr,
+                        data_type: new_data_type,
+                        column_id: new_column_id,
+                        computed_expr: new_computed_expr,
+                    } = new_field;
+                    old_name == new_name
+                        && old_default_expr == new_default_expr
+                        && old_column_id == new_column_id
+                        && old_computed_expr == new_computed_expr
+                        && (old_data_type == new_data_type
+                            || is_string_to_binary(&old_field.data_type, &new_field.data_type))
+                });
+
+        if is_alter_column_string_to_binary {
+            table_info.meta.schema = new_schema.into();
+
+            let table_id = table_info.ident.table_id;
+            let table_version = table_info.ident.seq;
+
+            let req = UpdateTableMetaReq {
+                table_id,
+                seq: MatchSeq::Exact(table_version),
+                new_table_meta: table_info.meta,
+            };
+
+            let _resp = catalog
+                .update_single_table_meta(req, table.get_table_info())
+                .await?;
+
             return Ok(PipelineBuildResult::create());
         }
 
@@ -301,7 +378,6 @@ impl ModifyTableColumnInterpreter {
         };
 
         // 4. define select schema and insert schema of DistributedInsertSelect plan
-        let mut table_info = table.get_table_info().clone();
         table_info.meta.schema = new_schema.clone().into();
         let new_table = FuseTable::try_create(table_info)?;
 
@@ -310,7 +386,6 @@ impl ModifyTableColumnInterpreter {
             PhysicalPlan::DistributedInsertSelect(Box::new(DistributedInsertSelect {
                 plan_id: select_plan.get_id(),
                 input: Box::new(select_plan),
-                catalog_info,
                 table_info: new_table.get_table_info().clone(),
                 select_schema: Arc::new(Arc::new(schema).into()),
                 select_column_bindings,
@@ -318,46 +393,67 @@ impl ModifyTableColumnInterpreter {
                 cast_needed: true,
             }));
         let mut build_res =
-            build_query_pipeline_without_render_result_set(&self.ctx, &insert_plan, false).await?;
+            build_query_pipeline_without_render_result_set(&self.ctx, &insert_plan).await?;
 
         // 6. commit new meta schema and snapshots
         new_table.commit_insertion(
             self.ctx.clone(),
             &mut build_res.main_pipeline,
             None,
+            vec![],
             true,
             prev_snapshot_id,
+            None,
         )?;
 
-        if build_res.main_pipeline.is_empty() {
-            heartbeat.shutdown().await?;
-        } else {
-            build_res.main_pipeline.set_on_finished(move |may_error| {
-                // shutdown table lock heartbeat.
-                GlobalIORuntime::instance().block_on(async move { heartbeat.shutdown().await })?;
-                match may_error {
-                    None => Ok(()),
-                    Some(error_code) => Err(error_code.clone()),
-                }
-            });
+        Ok(build_res)
+    }
+
+    // unset data mask policy to a column is a ee feature.
+    async fn do_unset_data_mask_policy(
+        &self,
+        catalog: Arc<dyn Catalog>,
+        table: Arc<dyn Table>,
+        column: String,
+    ) -> Result<PipelineBuildResult> {
+        LicenseManagerSwitch::instance()
+            .check_enterprise_enabled(self.ctx.get_license_key(), DataMask)?;
+
+        let table_info = table.get_table_info();
+        let table_id = table_info.ident.table_id;
+        let table_version = table_info.ident.seq;
+
+        let prev_column_mask_name =
+            if let Some(column_mask_policy) = &table_info.meta.column_mask_policy {
+                column_mask_policy.get(&column).cloned()
+            } else {
+                None
+            };
+
+        if let Some(prev_column_mask_name) = prev_column_mask_name {
+            let req = SetTableColumnMaskPolicyReq {
+                tenant: self.ctx.get_tenant(),
+                seq: MatchSeq::Exact(table_version),
+                table_id,
+                column,
+                action: SetTableColumnMaskPolicyAction::Unset(prev_column_mask_name),
+            };
+
+            let _resp = catalog.set_table_column_mask_policy(req).await?;
         }
 
-        Ok(build_res)
+        Ok(PipelineBuildResult::create())
     }
 
     async fn do_convert_stored_computed_column(
         &self,
         catalog: Arc<dyn Catalog>,
-        table: &Arc<dyn Table>,
+        table: Arc<dyn Table>,
         table_meta: TableMeta,
         column: String,
     ) -> Result<PipelineBuildResult> {
-        let license_manager = get_license_manager();
-        license_manager.manager.check_enterprise_enabled(
-            &self.ctx.get_settings(),
-            self.ctx.get_tenant(),
-            ComputedColumn,
-        )?;
+        LicenseManagerSwitch::instance()
+            .check_enterprise_enabled(self.ctx.get_license_key(), ComputedColumn)?;
 
         let table_info = table.get_table_info();
         let schema = table.schema();
@@ -393,20 +489,9 @@ impl ModifyTableColumnInterpreter {
             table_id,
             seq: MatchSeq::Exact(table_version),
             new_table_meta,
-            copied_files: None,
-            deduplicated_label: None,
         };
 
-        let res = catalog.update_table_meta(table_info, req).await?;
-
-        if let Some(share_table_info) = res.share_table_info {
-            save_share_table_info(
-                &self.ctx.get_tenant(),
-                self.ctx.get_data_operator()?.operator(),
-                share_table_info,
-            )
-            .await?;
-        }
+        let _resp = catalog.update_single_table_meta(req, table_info).await?;
 
         Ok(PipelineBuildResult::create())
     }
@@ -418,56 +503,51 @@ impl Interpreter for ModifyTableColumnInterpreter {
         "ModifyTableColumnInterpreter"
     }
 
+    fn is_ddl(&self) -> bool {
+        true
+    }
+
     #[async_backtrace::framed]
     async fn execute2(&self) -> Result<PipelineBuildResult> {
         let catalog_name = self.plan.catalog.as_str();
         let db_name = self.plan.database.as_str();
         let tbl_name = self.plan.table.as_str();
 
-        let tbl = self
-            .ctx
-            .get_catalog(catalog_name)
-            .await?
-            .get_table(self.ctx.get_tenant().as_str(), db_name, tbl_name)
-            .await
-            .ok();
+        let catalog = self.ctx.get_catalog(catalog_name).await?;
+        let table = self.ctx.get_table(catalog_name, db_name, tbl_name).await?;
 
-        let table = if let Some(table) = &tbl {
-            table
-        } else {
-            return Ok(PipelineBuildResult::create());
-        };
+        table.check_mutable()?;
 
         let table_info = table.get_table_info();
-        if table_info.engine() == VIEW_ENGINE {
+        let engine = table.engine();
+        if matches!(engine, VIEW_ENGINE | STREAM_ENGINE) {
             return Err(ErrorCode::TableEngineNotSupported(format!(
-                "{}.{} engine is VIEW that doesn't support alter",
-                &self.plan.database, &self.plan.table
+                "{}.{} engine is {} that doesn't support alter",
+                db_name, tbl_name, engine
             )));
         }
         if table_info.db_type != DatabaseType::NormalDB {
             return Err(ErrorCode::TableEngineNotSupported(format!(
                 "{}.{} doesn't support alter",
-                &self.plan.database, &self.plan.table
+                db_name, tbl_name
             )));
         }
 
-        let catalog = self.ctx.get_catalog(catalog_name).await?;
         let table_meta = table.get_table_info().meta.clone();
 
         // NOTICE: if we support modify column data type,
         // need to check whether this column is referenced by other computed columns.
-        match &self.plan.action {
+        let mut build_res = match &self.plan.action {
             ModifyColumnAction::SetMaskingPolicy(column, mask_name) => {
                 self.do_set_data_mask_policy(catalog, table, column.to_string(), mask_name.clone())
-                    .await
+                    .await?
             }
             ModifyColumnAction::UnsetMaskingPolicy(column) => {
                 self.do_unset_data_mask_policy(catalog, table, column.to_string())
-                    .await
+                    .await?
             }
-            ModifyColumnAction::SetDataType(column_name_types) => {
-                self.do_set_data_type(table, column_name_types).await
+            ModifyColumnAction::SetDataType(field_and_comment) => {
+                self.do_set_data_type(table, field_and_comment).await?
             }
             ModifyColumnAction::ConvertStoredComputedColumn(column) => {
                 self.do_convert_stored_computed_column(
@@ -476,8 +556,13 @@ impl Interpreter for ModifyTableColumnInterpreter {
                     table_meta,
                     column.to_string(),
                 )
-                .await
+                .await?
             }
-        }
+        };
+
+        build_res
+            .main_pipeline
+            .add_lock_guard(self.plan.lock_guard.clone());
+        Ok(build_res)
     }
 }

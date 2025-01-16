@@ -17,70 +17,70 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ahash::AHashMap;
-use common_arrow::arrow::bitmap::MutableBitmap;
-use common_base::base::tokio::sync::OwnedSemaphorePermit;
-use common_base::base::tokio::sync::Semaphore;
-use common_base::base::ProgressValues;
-use common_base::runtime::GlobalIORuntime;
-use common_base::runtime::TrySpawn;
-use common_catalog::plan::Projection;
-use common_catalog::table_context::TableContext;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::ColumnId;
-use common_expression::ComputedExpr;
-use common_expression::DataBlock;
-use common_expression::FieldIndex;
-use common_expression::Scalar;
-use common_expression::TableSchema;
-use common_sql::evaluator::BlockOperator;
-use common_sql::executor::OnConflictField;
+use databend_common_base::base::tokio::sync::Semaphore;
+use databend_common_base::runtime::GlobalIORuntime;
+use databend_common_base::runtime::TrySpawn;
+use databend_common_catalog::plan::gen_mutation_stream_meta;
+use databend_common_catalog::plan::Projection;
+use databend_common_catalog::table::Table;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::types::DataType;
+use databend_common_expression::types::MutableBitmap;
+use databend_common_expression::types::NumberDataType;
+use databend_common_expression::types::UInt64Type;
+use databend_common_expression::BlockEntry;
+use databend_common_expression::Column;
+use databend_common_expression::ColumnId;
+use databend_common_expression::ComputedExpr;
+use databend_common_expression::DataBlock;
+use databend_common_expression::FieldIndex;
+use databend_common_expression::FromData;
+use databend_common_expression::Scalar;
+use databend_common_expression::Value;
+use databend_common_metrics::storage::*;
+use databend_common_sql::evaluator::BlockOperator;
+use databend_common_sql::executor::physical_plans::OnConflictField;
+use databend_common_sql::StreamContext;
+use databend_storages_common_cache::LoadParams;
+use databend_storages_common_index::filters::Filter;
+use databend_storages_common_index::filters::Xor8Filter;
+use databend_storages_common_index::BloomIndex;
+use databend_storages_common_io::ReadSettings;
+use databend_storages_common_table_meta::meta::BlockMeta;
+use databend_storages_common_table_meta::meta::BlockSlotDescription;
+use databend_storages_common_table_meta::meta::ColumnStatistics;
+use databend_storages_common_table_meta::meta::Location;
+use databend_storages_common_table_meta::meta::SegmentInfo;
 use log::info;
 use log::warn;
 use opendal::Operator;
-use storages_common_cache::LoadParams;
-use storages_common_index::filters::Filter;
-use storages_common_index::filters::Xor8Filter;
-use storages_common_index::BloomIndex;
-use storages_common_table_meta::meta::BlockMeta;
-use storages_common_table_meta::meta::ColumnStatistics;
-use storages_common_table_meta::meta::Location;
-use storages_common_table_meta::meta::SegmentInfo;
 
 use crate::io::read::bloom::block_filter_reader::BloomBlockFilterReader;
-use crate::io::write_data;
 use crate::io::BlockBuilder;
 use crate::io::BlockReader;
+use crate::io::BlockWriter;
 use crate::io::CompactSegmentInfoReader;
 use crate::io::MetaReaders;
-use crate::io::ReadSettings;
 use crate::io::WriteSettings;
-use crate::metrics::metrics_inc_replace_accumulated_merge_action_time_ms;
-use crate::metrics::metrics_inc_replace_apply_deletion_time_ms;
-use crate::metrics::metrics_inc_replace_block_number_after_pruning;
-use crate::metrics::metrics_inc_replace_block_number_bloom_pruned;
-use crate::metrics::metrics_inc_replace_block_number_totally_loaded;
-use crate::metrics::metrics_inc_replace_block_number_write;
-use crate::metrics::metrics_inc_replace_block_of_zero_row_deleted;
-use crate::metrics::metrics_inc_replace_number_accumulated_merge_action;
-use crate::metrics::metrics_inc_replace_number_apply_deletion;
-use crate::metrics::metrics_inc_replace_row_number_after_pruning;
-use crate::metrics::metrics_inc_replace_row_number_totally_loaded;
-use crate::metrics::metrics_inc_replace_row_number_write;
-use crate::metrics::metrics_inc_replace_segment_number_after_pruning;
-use crate::metrics::metrics_inc_replace_whole_block_deletion;
+use crate::operations::acquire_task_permit;
 use crate::operations::common::BlockMetaIndex;
 use crate::operations::common::MutationLogEntry;
 use crate::operations::common::MutationLogs;
 use crate::operations::mutation::BlockIndex;
 use crate::operations::mutation::SegmentIndex;
-use crate::operations::replace_into::meta::merge_into_operation_meta::DeletionByColumn;
-use crate::operations::replace_into::meta::merge_into_operation_meta::MergeIntoOperation;
-use crate::operations::replace_into::meta::merge_into_operation_meta::UniqueKeyDigest;
-use crate::operations::replace_into::mutator::column_hash::row_hash_of_columns;
-use crate::operations::replace_into::mutator::deletion_accumulator::DeletionAccumulator;
+use crate::operations::read_block;
+use crate::operations::replace_into::meta::DeletionByColumn;
+use crate::operations::replace_into::meta::MergeIntoOperation;
+use crate::operations::replace_into::meta::UniqueKeyDigest;
+use crate::operations::replace_into::mutator::row_hash_of_columns;
+use crate::operations::replace_into::mutator::DeletionAccumulator;
+use crate::FuseTable;
+
 struct AggregationContext {
     segment_locations: AHashMap<SegmentIndex, Location>,
+    block_slots_in_charge: Option<BlockSlotDescription>,
     // the fields specified in ON CONFLICT clause
     on_conflict_fields: Vec<OnConflictField>,
     // the field indexes of `on_conflict_fields`
@@ -98,6 +98,8 @@ struct AggregationContext {
     segment_reader: CompactSegmentInfoReader,
     block_builder: BlockBuilder,
     io_request_semaphore: Arc<Semaphore>,
+    // generate stream columns if necessary
+    stream_ctx: Option<StreamContext>,
 }
 
 // Apply MergeIntoOperations to segments
@@ -113,13 +115,17 @@ impl MergeIntoOperationAggregator {
         on_conflict_fields: Vec<OnConflictField>,
         bloom_filter_column_indexes: Vec<FieldIndex>,
         segment_locations: Vec<(SegmentIndex, Location)>,
-        data_accessor: Operator,
-        table_schema: Arc<TableSchema>,
-        write_settings: WriteSettings,
+        block_slots: Option<BlockSlotDescription>,
+        table: &FuseTable,
         read_settings: ReadSettings,
         block_builder: BlockBuilder,
         io_request_semaphore: Arc<Semaphore>,
     ) -> Result<Self> {
+        let data_accessor = table.get_operator();
+        let table_schema = table.schema_with_stream();
+        let write_settings = table.get_write_settings();
+        let update_stream_columns = table.change_tracking_enabled();
+
         let deletion_accumulator = DeletionAccumulator::default();
         let segment_reader =
             MetaReaders::segment_info_reader(data_accessor.clone(), table_schema.clone());
@@ -146,10 +152,12 @@ impl MergeIntoOperationAggregator {
         let key_column_reader = {
             let projection = Projection::Columns(key_column_field_indexes);
             BlockReader::create(
+                ctx.clone(),
                 data_accessor.clone(),
                 table_schema.clone(),
                 projection,
-                ctx.clone(),
+                false,
+                update_stream_columns,
                 false,
             )
         }?;
@@ -160,20 +168,35 @@ impl MergeIntoOperationAggregator {
             } else {
                 let projection = Projection::Columns(remain_column_field_ids.clone());
                 let reader = BlockReader::create(
-                    data_accessor.clone(),
-                    table_schema,
-                    projection,
                     ctx.clone(),
+                    data_accessor.clone(),
+                    table_schema.clone(),
+                    projection,
+                    false,
+                    update_stream_columns,
                     false,
                 )?;
                 Some(reader)
             }
         };
 
+        let stream_ctx = if update_stream_columns {
+            Some(StreamContext::try_create(
+                ctx.get_function_context()?,
+                table_schema,
+                table.get_table_info().ident.seq,
+                true,
+                false,
+            )?)
+        } else {
+            None
+        };
+
         Ok(Self {
             deletion_accumulator,
             aggregation_ctx: Arc::new(AggregationContext {
-                segment_locations: AHashMap::from_iter(segment_locations.into_iter()),
+                segment_locations: AHashMap::from_iter(segment_locations),
+                block_slots_in_charge: block_slots,
                 on_conflict_fields,
                 bloom_filter_column_indexes,
                 remain_column_field_ids,
@@ -185,6 +208,7 @@ impl MergeIntoOperationAggregator {
                 segment_reader,
                 block_builder,
                 io_request_semaphore,
+                stream_ctx,
             }),
         })
     }
@@ -232,6 +256,14 @@ impl MergeIntoOperationAggregator {
 
                             // block level pruning, using range index
                             for (block_index, block_meta) in seg.blocks.iter().enumerate() {
+                                if let Some(BlockSlotDescription { num_slots, slot }) =
+                                    &aggregation_ctx.block_slots_in_charge
+                                {
+                                    if block_index % num_slots != *slot as usize {
+                                        // skip this block
+                                        continue;
+                                    }
+                                }
                                 if aggregation_ctx
                                     .overlapped(&block_meta.col_stats, columns_min_max)
                                 {
@@ -307,24 +339,19 @@ impl MergeIntoOperationAggregator {
             let segment_info: SegmentInfo = compact_segment_info.try_into()?;
 
             for (block_index, keys) in block_deletion {
-                let permit = aggregation_ctx.acquire_task_permit().await?;
+                let permit =
+                    acquire_task_permit(aggregation_ctx.io_request_semaphore.clone()).await?;
                 let block_meta = segment_info.blocks[block_index].clone();
                 let aggregation_ctx = aggregation_ctx.clone();
                 num_rows_mutated += block_meta.row_count;
-                let handle = io_runtime.spawn(async_backtrace::location!().frame({
-                    async move {
-                        let mutation_log_entry = aggregation_ctx
-                            .apply_deletion_to_data_block(
-                                segment_idx,
-                                block_index,
-                                &block_meta,
-                                &keys,
-                            )
-                            .await?;
-                        drop(permit);
-                        Ok::<_, ErrorCode>(mutation_log_entry)
-                    }
-                }));
+                // self.aggregation_ctx.
+                let handle = io_runtime.spawn(async move {
+                    let mutation_log_entry = aggregation_ctx
+                        .apply_deletion_to_data_block(segment_idx, block_index, &block_meta, &keys)
+                        .await?;
+                    drop(permit);
+                    Ok::<_, ErrorCode>(mutation_log_entry)
+                });
                 mutation_log_handlers.push(handle)
             }
         }
@@ -385,7 +412,13 @@ impl AggregationContext {
             return Ok(None);
         }
 
-        let key_columns_data = self.read_block(&self.key_column_reader, block_meta).await?;
+        let key_columns_data = read_block(
+            self.write_settings.storage_format,
+            &self.key_column_reader,
+            block_meta,
+            &self.read_settings,
+        )
+        .await?;
 
         let num_rows = key_columns_data.num_rows();
 
@@ -417,7 +450,7 @@ impl AggregationContext {
             }
         }
 
-        let delete_nums = bitmap.unset_bits();
+        let delete_nums = bitmap.null_count();
         info!("number of row deleted: {}", delete_nums);
 
         // shortcut: nothing to be deleted
@@ -428,21 +461,11 @@ impl AggregationContext {
             return Ok(None);
         }
 
-        let progress_values = ProgressValues {
-            rows: delete_nums,
-            // ignore bytes.
-            bytes: 0,
-        };
-
-        self.block_builder
-            .ctx
-            .get_write_progress()
-            .incr(&progress_values);
-
         // shortcut: whole block deletion
         if delete_nums == block_meta.row_count as usize {
             info!("whole block deletion");
             metrics_inc_replace_whole_block_deletion(1);
+            metrics_inc_replace_deleted_blocks_rows(num_rows as u64);
             // whole block deletion
             // NOTE that if deletion marker is enabled, check the real meaning of `row_count`
             let mutation = MutationLogEntry::DeletedBlock {
@@ -458,7 +481,7 @@ impl AggregationContext {
         let bitmap = bitmap.into();
         let mut key_columns_data_after_deletion = key_columns_data.filter_with_bitmap(&bitmap)?;
 
-        let new_block = match &self.remain_column_reader {
+        let mut new_block = match &self.remain_column_reader {
             None => key_columns_data_after_deletion,
             Some(remain_columns_reader) => {
                 metrics_inc_replace_block_number_totally_loaded(1);
@@ -492,35 +515,52 @@ impl AggregationContext {
             }
         };
 
+        if let Some(stream_ctx) = &self.stream_ctx {
+            // generate row id column
+            let mut row_ids = Vec::with_capacity(num_rows);
+            for i in 0..num_rows {
+                row_ids.push(i as u64);
+            }
+            let value = Value::Column(Column::filter(&UInt64Type::from_data(row_ids), &bitmap));
+            let row_num = BlockEntry::new(
+                DataType::Nullable(Box::new(DataType::Number(NumberDataType::UInt64))),
+                value.wrap_nullable(None),
+            );
+            new_block.add_column(row_num);
+
+            let stream_meta = gen_mutation_stream_meta(None, &block_meta.location.0)?;
+            new_block = stream_ctx.apply(new_block, &stream_meta)?;
+        }
+
         // serialization and compression is cpu intensive, send them to dedicated thread pool
         // and wait (asyncly, which will NOT block the executor thread)
         let block_builder = self.block_builder.clone();
         let origin_stats = block_meta.cluster_stats.clone();
         let serialized = GlobalIORuntime::instance()
-            .spawn_blocking(move || {
+            .spawn(async move {
                 block_builder.build(new_block, |block, generator| {
                     let cluster_stats =
                         generator.gen_with_origin_stats(&block, origin_stats.clone())?;
                     Ok((cluster_stats, block))
                 })
             })
-            .await?;
+            .await
+            .map_err(|e| {
+                ErrorCode::Internal(
+                    "unexpected, failed to join apply delete tasks for replace into.",
+                )
+                .add_message_back(e.to_string())
+            })??;
 
         // persistent data
-        let new_block_meta = serialized.block_meta;
-        let new_block_location = new_block_meta.location.0.clone();
-        let new_block_raw_data = serialized.block_raw_data;
-        let data_accessor = self.data_accessor.clone();
-        write_data(new_block_raw_data, &data_accessor, &new_block_location).await?;
+        let new_block_meta = BlockWriter::write_down(&self.data_accessor, serialized).await?;
 
         metrics_inc_replace_block_number_write(1);
         metrics_inc_replace_row_number_write(new_block_meta.row_count);
-        if let Some(index_state) = serialized.bloom_index_state {
-            write_data(index_state.data, &data_accessor, &index_state.location.0).await?;
-        }
+        metrics_inc_replace_replaced_blocks_rows(num_rows as u64);
 
         // generate log
-        let mutation = MutationLogEntry::Replaced {
+        let mutation = MutationLogEntry::ReplacedBlock {
             index: BlockMetaIndex {
                 segment_idx: segment_index,
                 block_idx: block_index,
@@ -529,20 +569,6 @@ impl AggregationContext {
         };
 
         Ok(Some(mutation))
-    }
-
-    #[async_backtrace::framed]
-    async fn acquire_task_permit(&self) -> Result<OwnedSemaphorePermit> {
-        let permit = self
-            .io_request_semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|e| {
-                ErrorCode::Internal("unexpected, io request semaphore is closed. {}")
-                    .add_message_back(e.to_string())
-            })?;
-        Ok(permit)
     }
 
     fn overlapped(
@@ -578,11 +604,12 @@ impl AggregationContext {
         if let Some(stats) = column_stats {
             let max = stats.max();
             let min = stats.min();
-            std::cmp::min(key_max, max) >= std::cmp::max(key_min, min)
+            std::cmp::min(key_max, max) >= std::cmp::max(key_min,min)
                 || // coincide overlap
                 (max == key_max && min == key_min)
         } else {
-            false
+            // if column range index does not exist, assume overlapped
+            true
         }
     }
 
@@ -592,6 +619,7 @@ impl AggregationContext {
                 &self.read_settings,
                 &block_meta.location.0,
                 &block_meta.col_metas,
+                &None,
             )
             .await?;
 
@@ -601,18 +629,24 @@ impl AggregationContext {
         let block_meta_ptr = block_meta.clone();
         let reader = reader.clone();
         GlobalIORuntime::instance()
-            .spawn_blocking(move || {
-                let column_chunks = merged_io_read_result.columns_chunks()?;
-                reader.deserialize_chunks(
-                    block_meta_ptr.location.0.as_str(),
-                    block_meta_ptr.row_count as usize,
-                    &block_meta_ptr.compression,
-                    &block_meta_ptr.col_metas,
-                    column_chunks,
-                    &storage_format,
-                )
-            })
+            .spawn(async move {
+                            let column_chunks = merged_io_read_result.columns_chunks()?;
+                            reader.deserialize_chunks(
+                                block_meta_ptr.location.0.as_str(),
+                                block_meta_ptr.row_count as usize,
+                                &block_meta_ptr.compression,
+                                &block_meta_ptr.col_metas,
+                                column_chunks,
+                                &storage_format,
+                            )
+                        })
             .await
+            .map_err(|e| {
+                ErrorCode::Internal(
+                    "unexpected, failed to join aggregation context read block tasks for replace into.",
+                )
+                .add_message_back(e.to_string())
+            })?
     }
 
     // return true if the block is pruned, otherwise false
@@ -731,10 +765,11 @@ impl AggregationContext {
 
 #[cfg(test)]
 mod tests {
-    use common_expression::types::NumberDataType;
-    use common_expression::types::NumberScalar;
-    use common_expression::TableDataType;
-    use common_expression::TableField;
+    use databend_common_expression::types::NumberDataType;
+    use databend_common_expression::types::NumberScalar;
+    use databend_common_expression::TableDataType;
+    use databend_common_expression::TableField;
+    use databend_common_expression::TableSchema;
 
     use super::*;
 
@@ -789,8 +824,8 @@ mod tests {
             (
                 1,
                 range(
-                    Scalar::String("a".to_string().into_bytes()),
-                    Scalar::String("z".to_string().into_bytes()),
+                    Scalar::String("a".to_string()),
+                    Scalar::String("z".to_string()),
                 ),
             ),
             // range of xx_time [100, 200]
@@ -828,8 +863,8 @@ mod tests {
             ),
             // for xx_type column, overlaps
             (
-                Scalar::String("b".to_string().into_bytes()),
-                Scalar::String("y".to_string().into_bytes()),
+                Scalar::String("b".to_string()),
+                Scalar::String("y".to_string()),
             ),
             // for xx_time column, overlaps
             (
@@ -873,8 +908,8 @@ mod tests {
             ),
             // for xx_type column, overlaps
             (
-                Scalar::String("b".to_string().into_bytes()),
-                Scalar::String("b".to_string().into_bytes()),
+                Scalar::String("b".to_string()),
+                Scalar::String("b".to_string()),
             ),
             // for xx_time column, overlaps
             (
@@ -890,6 +925,56 @@ mod tests {
         );
 
         assert!(!overlap);
+
+        // case 3: (column rang index not exist)
+        //
+        // - min/max of input block
+        //
+        //  'xx_id' : [11, 12]
+        //  'xx_type' : ["b", "b"]
+        //  'xx_time' : [100, 100]
+        //
+        // - the range index of columns are (after tweaks)
+        //
+        //   'xx_type' : ["a", "z"]
+        //   'xx_time' : [100, 200]
+        //
+        // - expected : overlap == true
+        //
+        //   range index of column 'xx_id' does not exist (explicitly removed)
+        //   the result should be overlapped
+
+        let input_column_min_max = [
+            // for xx_id column, NOT overlaps
+            (
+                Scalar::Number(NumberScalar::UInt64(11)),
+                Scalar::Number(NumberScalar::UInt64(12)),
+            ),
+            // for xx_type column, overlaps
+            (
+                Scalar::String("b".to_string()),
+                Scalar::String("b".to_string()),
+            ),
+            // for xx_time column, overlaps
+            (
+                Scalar::Number(NumberScalar::UInt32(100)),
+                Scalar::Number(NumberScalar::UInt32(100)),
+            ),
+        ];
+
+        let column_range_indexes = {
+            let mut cloned = column_range_indexes;
+            cloned.remove(&0); // remove range index of col xx_id
+            cloned
+        };
+
+        let overlap = super::AggregationContext::check_overlap(
+            &on_conflict_fields,
+            &column_range_indexes,
+            &input_column_min_max,
+        );
+
+        assert!(overlap);
 
         Ok(())
     }

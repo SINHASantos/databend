@@ -14,13 +14,16 @@
 
 use std::fmt::Display;
 
+use borsh::BorshDeserialize;
+use borsh::BorshSerialize;
 use bumpalo::Bump;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::types::DataType;
-use common_expression::Column;
-use common_expression::ColumnBuilder;
-use common_expression::Scalar;
+use databend_common_base::runtime::drop_guard;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::types::DataType;
+use databend_common_expression::Column;
+use databend_common_expression::ColumnBuilder;
+use databend_common_expression::Scalar;
 
 use super::AggregateFunctionFactory;
 use super::AggregateFunctionRef;
@@ -123,11 +126,13 @@ impl EvalAggr {
 
 impl Drop for EvalAggr {
     fn drop(&mut self) {
-        if self.func.need_manual_drop_state() {
-            unsafe {
-                self.func.drop_state(self.addr);
+        drop_guard(move || {
+            if self.func.need_manual_drop_state() {
+                unsafe {
+                    self.func.drop_state(self.addr);
+                }
             }
-        }
+        })
     }
 }
 
@@ -138,15 +143,28 @@ pub fn eval_aggr(
     rows: usize,
 ) -> Result<(Column, DataType)> {
     let factory = AggregateFunctionFactory::instance();
-    let cols: Vec<Column> = columns.to_owned();
     let arguments = columns.iter().map(|x| x.data_type()).collect();
 
     let func = factory.get(name, params, arguments)?;
     let data_type = func.return_type()?;
 
     let eval = EvalAggr::new(func.clone());
-    func.accumulate(eval.addr, &cols, None, rows)?;
+    func.accumulate(eval.addr, columns.into(), None, rows)?;
     let mut builder = ColumnBuilder::with_capacity(&data_type, 1024);
     func.merge_result(eval.addr, &mut builder)?;
     Ok((builder.build(), data_type))
+}
+
+#[inline]
+pub fn borsh_serialize_state<W: std::io::Write, T: BorshSerialize>(
+    writer: &mut W,
+    value: &T,
+) -> Result<()> {
+    borsh::to_writer(writer, value)?;
+    Ok(())
+}
+
+#[inline]
+pub fn borsh_deserialize_state<T: BorshDeserialize>(slice: &mut &[u8]) -> Result<T> {
+    Ok(T::deserialize(slice)?)
 }

@@ -14,39 +14,42 @@
 
 use std::sync::Arc;
 
-use common_arrow::parquet::metadata::ColumnDescriptor;
-use common_catalog::plan::DataSourcePlan;
-use common_catalog::plan::Projection;
-use common_catalog::table_context::TableContext;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::types::DataType;
-use common_expression::types::NumberDataType;
-use common_expression::BlockEntry;
-use common_expression::ColumnBuilder;
-use common_expression::DataBlock;
-use common_expression::DataSchema;
-use common_expression::Value;
-use common_pipeline_core::processors::port::InputPort;
-use common_pipeline_core::processors::port::OutputPort;
-use common_pipeline_core::processors::processor::ProcessorPtr;
-use common_pipeline_core::Pipeline;
-use common_pipeline_transforms::processors::transforms::AsyncTransform;
-use common_pipeline_transforms::processors::transforms::AsyncTransformer;
+use databend_common_catalog::plan::DataSourcePlan;
+use databend_common_catalog::plan::Projection;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::types::nullable::NullableColumn;
+use databend_common_expression::types::Bitmap;
+use databend_common_expression::types::DataType;
+use databend_common_expression::types::NumberDataType;
+use databend_common_expression::BlockEntry;
+use databend_common_expression::Column;
+use databend_common_expression::ColumnBuilder;
+use databend_common_expression::DataBlock;
+use databend_common_expression::DataSchema;
+use databend_common_expression::Value;
+use databend_common_pipeline_core::processors::InputPort;
+use databend_common_pipeline_core::processors::OutputPort;
+use databend_common_pipeline_core::processors::ProcessorPtr;
+use databend_common_pipeline_transforms::processors::AsyncTransform;
+use databend_common_pipeline_transforms::processors::AsyncTransformer;
+use databend_storages_common_io::ReadSettings;
 
 use super::native_rows_fetcher::NativeRowsFetcher;
 use super::parquet_rows_fetcher::ParquetRowsFetcher;
-use crate::io::ReadSettings;
 use crate::FuseStorageFormat;
 use crate::FuseTable;
 
-pub fn build_row_fetcher_pipeline(
+type RowFetcher = Box<dyn Fn(Arc<InputPort>, Arc<OutputPort>) -> Result<ProcessorPtr>>;
+
+pub fn row_fetch_processor(
     ctx: Arc<dyn TableContext>,
-    pipeline: &mut Pipeline,
     row_id_col_offset: usize,
     source: &DataSourcePlan,
     projection: Projection,
-) -> Result<()> {
+    need_wrap_nullable: bool,
+) -> Result<RowFetcher> {
     let table = ctx.build_table_from_source_plan(source)?;
     let fuse_table = table
         .as_any()
@@ -54,51 +57,44 @@ pub fn build_row_fetcher_pipeline(
         .ok_or_else(|| ErrorCode::Internal("Row fetcher is only supported by Fuse engine"))?
         .to_owned();
     let fuse_table = Arc::new(fuse_table);
-    let block_reader = fuse_table.create_block_reader(projection.clone(), false, ctx.clone())?;
+    let block_reader =
+        fuse_table.create_block_reader(ctx.clone(), projection.clone(), false, false, true)?;
+    let max_threads = ctx.get_settings().get_max_threads()? as usize;
 
-    pipeline.add_transform(|input, output| {
-        Ok(match &fuse_table.storage_format {
-            FuseStorageFormat::Native => {
-                let mut column_leaves = Vec::with_capacity(block_reader.project_column_nodes.len());
-                for column_node in &block_reader.project_column_nodes {
-                    let leaves: Vec<ColumnDescriptor> = column_node
-                        .leaf_indices
-                        .iter()
-                        .map(|i| block_reader.parquet_schema_descriptor.columns()[*i].clone())
-                        .collect::<Vec<_>>();
-                    column_leaves.push(leaves);
-                }
-                if block_reader.support_blocking_api() {
-                    TransformRowsFetcher::create(
-                        input,
-                        output,
-                        row_id_col_offset,
-                        NativeRowsFetcher::<true>::create(
-                            fuse_table.clone(),
-                            projection.clone(),
-                            block_reader.clone(),
-                            column_leaves,
-                        ),
-                    )
-                } else {
-                    TransformRowsFetcher::create(
-                        input,
-                        output,
-                        row_id_col_offset,
-                        NativeRowsFetcher::<false>::create(
-                            fuse_table.clone(),
-                            projection.clone(),
-                            block_reader.clone(),
-                            column_leaves,
-                        ),
-                    )
-                }
-            }
-            FuseStorageFormat::Parquet => {
-                let buffer_size =
-                    ctx.get_settings().get_parquet_uncompressed_buffer_size()? as usize;
-                let read_settings = ReadSettings::from_ctx(&ctx)?;
-                if block_reader.support_blocking_api() {
+    match &fuse_table.storage_format {
+        FuseStorageFormat::Native => Ok(Box::new(move |input, output| {
+            Ok(if block_reader.support_blocking_api() {
+                TransformRowsFetcher::create(
+                    input,
+                    output,
+                    row_id_col_offset,
+                    NativeRowsFetcher::<true>::create(
+                        fuse_table.clone(),
+                        projection.clone(),
+                        block_reader.clone(),
+                        max_threads,
+                    ),
+                    need_wrap_nullable,
+                )
+            } else {
+                TransformRowsFetcher::create(
+                    input,
+                    output,
+                    row_id_col_offset,
+                    NativeRowsFetcher::<false>::create(
+                        fuse_table.clone(),
+                        projection.clone(),
+                        block_reader.clone(),
+                        max_threads,
+                    ),
+                    need_wrap_nullable,
+                )
+            })
+        })),
+        FuseStorageFormat::Parquet => {
+            let read_settings = ReadSettings::from_ctx(&ctx)?;
+            Ok(Box::new(move |input, output| {
+                Ok(if block_reader.support_blocking_api() {
                     TransformRowsFetcher::create(
                         input,
                         output,
@@ -108,8 +104,9 @@ pub fn build_row_fetcher_pipeline(
                             projection.clone(),
                             block_reader.clone(),
                             read_settings,
-                            buffer_size,
+                            max_threads,
                         ),
+                        need_wrap_nullable,
                     )
                 } else {
                     TransformRowsFetcher::create(
@@ -121,13 +118,14 @@ pub fn build_row_fetcher_pipeline(
                             projection.clone(),
                             block_reader.clone(),
                             read_settings,
-                            buffer_size,
+                            max_threads,
                         ),
+                        need_wrap_nullable,
                     )
-                }
-            }
-        })
-    })
+                })
+            }))
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -140,6 +138,7 @@ pub trait RowsFetcher {
 pub struct TransformRowsFetcher<F: RowsFetcher> {
     row_id_col_offset: usize,
     fetcher: F,
+    need_wrap_nullable: bool,
 }
 
 #[async_trait::async_trait]
@@ -167,18 +166,27 @@ where F: RowsFetcher + Send + Sync + 'static
             return Ok(data);
         }
 
-        let row_id_column = data.columns()[self.row_id_col_offset]
+        let entry = &data.columns()[self.row_id_col_offset];
+        let value = entry
             .value
-            .convert_to_full_column(&DataType::Number(NumberDataType::UInt64), num_rows)
-            .into_number()
-            .unwrap()
-            .into_u_int64()
-            .unwrap();
+            .convert_to_full_column(&entry.data_type, num_rows);
+        let row_id_column = if matches!(entry.data_type, DataType::Number(NumberDataType::UInt64)) {
+            value.into_number().unwrap().into_u_int64().unwrap()
+        } else {
+            // From merge into matched data, the row id column is nullable but has no null value.
+            let value = *value.into_nullable().unwrap();
+            debug_assert!(value.validity.null_count() == 0);
+            value.column.into_number().unwrap().into_u_int64().unwrap()
+        };
 
         let fetched_block = self.fetcher.fetch(&row_id_column).await?;
 
         for col in fetched_block.columns().iter() {
-            data.add_column(col.clone());
+            if self.need_wrap_nullable {
+                data.add_column(wrap_true_validity(col, num_rows));
+            } else {
+                data.add_column(col.clone());
+            }
         }
 
         Ok(data)
@@ -193,10 +201,23 @@ where F: RowsFetcher + Send + Sync + 'static
         output: Arc<OutputPort>,
         row_id_col_offset: usize,
         fetcher: F,
+        need_wrap_nullable: bool,
     ) -> ProcessorPtr {
         ProcessorPtr::create(AsyncTransformer::create(input, output, Self {
             row_id_col_offset,
             fetcher,
+            need_wrap_nullable,
         }))
+    }
+}
+
+fn wrap_true_validity(column: &BlockEntry, num_rows: usize) -> BlockEntry {
+    let (value, data_type) = (&column.value, &column.data_type);
+    let col = value.convert_to_full_column(data_type, num_rows);
+    if matches!(col, Column::Null { .. }) || col.as_nullable().is_some() {
+        column.clone()
+    } else {
+        let col = NullableColumn::new_column(col, Bitmap::new_trued(num_rows));
+        BlockEntry::new(data_type.wrap_nullable(), Value::Column(col))
     }
 }

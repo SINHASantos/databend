@@ -15,43 +15,44 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use chrono::NaiveDateTime;
-use chrono::TimeZone;
-use chrono::Utc;
-use common_catalog::plan::DataSourcePlan;
-use common_catalog::plan::PartStatistics;
-use common_catalog::plan::Partitions;
-use common_catalog::plan::PushDownInfo;
-use common_catalog::table_args::TableArgs;
-use common_catalog::table_context::TableContext;
-use common_catalog::table_function::TableFunction;
-use common_exception::ErrorCode;
-pub use common_exception::Result;
-use common_expression::types::DataType;
-use common_expression::types::NumberDataType;
-use common_expression::types::UInt32Type;
-use common_expression::types::ValueType;
-use common_expression::BlockEntry;
-use common_expression::DataBlock;
-use common_expression::Scalar;
-use common_expression::TableDataType;
-use common_expression::TableField;
-use common_expression::TableSchemaRef;
-use common_expression::TableSchemaRefExt;
-use common_expression::Value;
-use common_meta_app::principal::UserOptionFlag;
-use common_meta_app::schema::TableIdent;
-use common_meta_app::schema::TableInfo;
-use common_meta_app::schema::TableMeta;
-use common_meta_app::tenant::TenantQuota;
-use common_meta_types::MatchSeq;
-use common_pipeline_core::processors::port::OutputPort;
-use common_pipeline_core::processors::processor::ProcessorPtr;
-use common_pipeline_core::Pipeline;
-use common_pipeline_sources::AsyncSource;
-use common_pipeline_sources::AsyncSourcer;
-use common_storages_factory::Table;
-use common_users::UserApiProvider;
+use chrono::DateTime;
+use databend_common_catalog::plan::DataSourcePlan;
+use databend_common_catalog::plan::PartStatistics;
+use databend_common_catalog::plan::Partitions;
+use databend_common_catalog::plan::PushDownInfo;
+use databend_common_catalog::table_args::TableArgs;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_catalog::table_function::TableFunction;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::types::DataType;
+use databend_common_expression::types::NumberDataType;
+use databend_common_expression::types::UInt32Type;
+use databend_common_expression::types::ValueType;
+use databend_common_expression::BlockEntry;
+use databend_common_expression::DataBlock;
+use databend_common_expression::Scalar;
+use databend_common_expression::TableDataType;
+use databend_common_expression::TableField;
+use databend_common_expression::TableSchemaRef;
+use databend_common_expression::TableSchemaRefExt;
+use databend_common_expression::Value;
+use databend_common_meta_app::principal::UserOptionFlag;
+use databend_common_meta_app::schema::TableIdent;
+use databend_common_meta_app::schema::TableInfo;
+use databend_common_meta_app::schema::TableMeta;
+use databend_common_meta_app::tenant::Tenant;
+use databend_common_meta_app::tenant::TenantQuota;
+use databend_common_meta_types::MatchSeq;
+use databend_common_meta_types::NonEmptyString;
+use databend_common_pipeline_core::processors::OutputPort;
+use databend_common_pipeline_core::processors::ProcessorPtr;
+use databend_common_pipeline_core::Pipeline;
+use databend_common_pipeline_sources::AsyncSource;
+use databend_common_pipeline_sources::AsyncSourcer;
+use databend_common_storages_factory::Table;
+use databend_common_users::UserApiProvider;
+use fastrace::func_name;
 
 pub struct TenantQuotaTable {
     table_info: TableInfo,
@@ -95,10 +96,8 @@ impl TenantQuotaTable {
                 engine: String::from(table_func_name),
                 // Assuming that created_on is unnecessary for function table,
                 // we could make created_on fixed to pass test_shuffle_action_try_into.
-                created_on: Utc
-                    .from_utc_datetime(&NaiveDateTime::from_timestamp_opt(0, 0).unwrap()),
-                updated_on: Utc
-                    .from_utc_datetime(&NaiveDateTime::from_timestamp_opt(0, 0).unwrap()),
+                created_on: DateTime::from_timestamp(0, 0).unwrap(),
+                updated_on: DateTime::from_timestamp(0, 0).unwrap(),
                 ..Default::default()
             },
             ..Default::default()
@@ -110,10 +109,6 @@ impl TenantQuotaTable {
 
 #[async_trait::async_trait]
 impl Table for TenantQuotaTable {
-    fn is_local(&self) -> bool {
-        true
-    }
-
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -137,7 +132,7 @@ impl Table for TenantQuotaTable {
         let args = self
             .args
             .iter()
-            .map(|s| Scalar::String(s.as_bytes().to_vec()))
+            .map(|s| Scalar::String(s.clone()))
             .collect();
         Some(TableArgs::new_positioned(args))
     }
@@ -147,9 +142,19 @@ impl Table for TenantQuotaTable {
         ctx: Arc<dyn TableContext>,
         _plan: &DataSourcePlan,
         pipeline: &mut Pipeline,
+        _put_cache: bool,
     ) -> Result<()> {
+        let tenants = self
+            .args
+            .iter()
+            .map(|s| NonEmptyString::new(s.clone()))
+            .collect::<std::result::Result<Vec<_>, &'static str>>()
+            .map_err(|_e| {
+                ErrorCode::TenantIsEmpty("tenant is empty when impl Table for TenantQutaTable")
+            })?;
+
         pipeline.add_source(
-            |output| TenantQuotaSource::create(ctx.clone(), output, self.args.clone()),
+            move |output| TenantQuotaSource::create(ctx.clone(), output, tenants.clone()),
             1,
         )?;
 
@@ -159,7 +164,7 @@ impl Table for TenantQuotaTable {
 
 struct TenantQuotaSource {
     ctx: Arc<dyn TableContext>,
-    args: Vec<String>,
+    args: Vec<NonEmptyString>,
     done: bool,
 }
 
@@ -167,7 +172,7 @@ impl TenantQuotaSource {
     pub fn create(
         ctx: Arc<dyn TableContext>,
         output: Arc<OutputPort>,
-        args: Vec<String>,
+        args: Vec<NonEmptyString>,
     ) -> Result<ProcessorPtr> {
         AsyncSourcer::create(ctx.clone(), output, TenantQuotaSource {
             ctx,
@@ -213,7 +218,6 @@ impl TenantQuotaSource {
 impl AsyncSource for TenantQuotaSource {
     const NAME: &'static str = "tenant_quota";
 
-    #[async_trait::unboxed_simple]
     #[async_backtrace::framed]
     async fn generate(&mut self) -> Result<Option<DataBlock>> {
         if self.done {
@@ -232,9 +236,9 @@ impl AsyncSource for TenantQuotaSource {
                     UserOptionFlag::TenantSetting
                 )));
             }
-            tenant = args[0].clone();
+            tenant = Tenant::new_or_err(args[0].clone(), func_name!())?;
         }
-        let quota_api = UserApiProvider::instance().get_tenant_quota_api_client(&tenant)?;
+        let quota_api = UserApiProvider::instance().tenant_quota_api(&tenant);
         let res = quota_api.get_quota(MatchSeq::GE(0)).await?;
         let mut quota = res.data;
 
@@ -242,15 +246,15 @@ impl AsyncSource for TenantQuotaSource {
             return Ok(Some(self.to_block(&quota)?));
         };
 
-        quota.max_databases = args[1].parse::<u32>()?;
+        quota.max_databases = args[1].as_str().parse::<u32>()?;
         if let Some(max_tables) = args.get(2) {
-            quota.max_tables_per_database = max_tables.parse::<u32>()?;
+            quota.max_tables_per_database = max_tables.as_str().parse::<u32>()?;
         };
         if let Some(max_stages) = args.get(3) {
-            quota.max_stages = max_stages.parse::<u32>()?;
+            quota.max_stages = max_stages.as_str().parse::<u32>()?;
         };
         if let Some(max_files_per_stage) = args.get(4) {
-            quota.max_files_per_stage = max_files_per_stage.parse::<u32>()?
+            quota.max_files_per_stage = max_files_per_stage.as_str().parse::<u32>()?
         };
 
         quota_api

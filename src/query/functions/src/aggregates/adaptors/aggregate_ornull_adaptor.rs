@@ -16,13 +16,13 @@ use std::alloc::Layout;
 use std::fmt;
 use std::sync::Arc;
 
-use common_arrow::arrow::bitmap::Bitmap;
-use common_exception::Result;
-use common_expression::types::DataType;
-use common_expression::Column;
-use common_expression::ColumnBuilder;
-use common_expression::Scalar;
-use common_io::prelude::BinaryWrite;
+use databend_common_exception::Result;
+use databend_common_expression::types::Bitmap;
+use databend_common_expression::types::DataType;
+use databend_common_expression::ColumnBuilder;
+use databend_common_expression::InputColumns;
+use databend_common_expression::Scalar;
+use databend_common_io::prelude::BinaryWrite;
 
 use crate::aggregates::aggregate_function_factory::AggregateFunctionFeatures;
 use crate::aggregates::AggregateFunction;
@@ -87,6 +87,10 @@ impl AggregateFunction for AggregateFunctionOrNullAdaptor {
         self.inner.init_state(place)
     }
 
+    fn serialize_size_per_row(&self) -> Option<usize> {
+        self.inner.serialize_size_per_row().map(|row| row + 1)
+    }
+
     #[inline]
     fn state_layout(&self) -> std::alloc::Layout {
         let layout = self.inner.state_layout();
@@ -97,7 +101,7 @@ impl AggregateFunction for AggregateFunctionOrNullAdaptor {
     fn accumulate(
         &self,
         place: StateAddr,
-        columns: &[Column],
+        columns: InputColumns,
         validity: Option<&Bitmap>,
         input_rows: usize,
     ) -> Result<()> {
@@ -116,7 +120,7 @@ impl AggregateFunction for AggregateFunctionOrNullAdaptor {
 
         if validity
             .as_ref()
-            .map(|c| c.unset_bits() != input_rows)
+            .map(|c| c.null_count() != input_rows)
             .unwrap_or(true)
         {
             self.set_flag(place, 1);
@@ -130,16 +134,17 @@ impl AggregateFunction for AggregateFunctionOrNullAdaptor {
         &self,
         places: &[StateAddr],
         offset: usize,
-        columns: &[Column],
+        columns: InputColumns,
         input_rows: usize,
     ) -> Result<()> {
         self.inner
             .accumulate_keys(places, offset, columns, input_rows)?;
         let if_cond = self.inner.get_if_condition(columns);
+
         match if_cond {
-            Some(v) if v.unset_bits() > 0 => {
+            Some(v) if v.null_count() > 0 => {
                 // all nulls
-                if v.unset_bits() == v.len() {
+                if v.null_count() == v.len() {
                     return Ok(());
                 }
 
@@ -160,7 +165,7 @@ impl AggregateFunction for AggregateFunctionOrNullAdaptor {
     }
 
     #[inline]
-    fn accumulate_row(&self, place: StateAddr, columns: &[Column], row: usize) -> Result<()> {
+    fn accumulate_row(&self, place: StateAddr, columns: InputColumns, row: usize) -> Result<()> {
         self.inner.accumulate_row(place, columns, row)?;
         self.set_flag(place, 1);
         Ok(())
@@ -173,16 +178,16 @@ impl AggregateFunction for AggregateFunctionOrNullAdaptor {
     }
 
     #[inline]
-    fn deserialize(&self, place: StateAddr, reader: &mut &[u8]) -> Result<()> {
-        let flag = reader[reader.len() - 1];
-        self.inner
-            .deserialize(place, &mut &reader[..reader.len() - 1])?;
-        self.set_flag(place, flag);
+    fn merge(&self, place: StateAddr, reader: &mut &[u8]) -> Result<()> {
+        let flag = self.get_flag(place) > 0 || reader[reader.len() - 1] > 0;
+
+        self.inner.merge(place, &mut &reader[..reader.len() - 1])?;
+        self.set_flag(place, flag as u8);
         Ok(())
     }
 
-    fn merge(&self, place: StateAddr, rhs: StateAddr) -> Result<()> {
-        self.inner.merge(place, rhs)?;
+    fn merge_states(&self, place: StateAddr, rhs: StateAddr) -> Result<()> {
+        self.inner.merge_states(place, rhs)?;
         let flag = self.get_flag(place) > 0 || self.get_flag(rhs) > 0;
         self.set_flag(place, u8::from(flag));
         Ok(())

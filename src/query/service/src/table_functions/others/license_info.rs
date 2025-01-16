@@ -17,40 +17,38 @@ use std::ops::Sub;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::NaiveDateTime;
-use chrono::TimeZone;
-use chrono::Utc;
-use common_catalog::plan::DataSourcePlan;
-use common_catalog::plan::PartStatistics;
-use common_catalog::plan::Partitions;
-use common_catalog::plan::PushDownInfo;
-use common_catalog::table_args::TableArgs;
-use common_catalog::table_context::TableContext;
-use common_catalog::table_function::TableFunction;
-use common_exception::ErrorCode;
-pub use common_exception::Result;
-use common_exception::ToErrorCode;
-use common_expression::types::DataType;
-use common_expression::BlockEntry;
-use common_expression::DataBlock;
-use common_expression::Scalar;
-use common_expression::TableDataType;
-use common_expression::TableField;
-use common_expression::TableSchemaRef;
-use common_expression::TableSchemaRefExt;
-use common_expression::Value;
-use common_license::license::Feature;
-use common_license::license::LicenseInfo;
-use common_license::license_manager::get_license_manager;
-use common_meta_app::schema::TableIdent;
-use common_meta_app::schema::TableInfo;
-use common_meta_app::schema::TableMeta;
-use common_pipeline_core::processors::port::OutputPort;
-use common_pipeline_core::processors::processor::ProcessorPtr;
-use common_pipeline_core::Pipeline;
-use common_pipeline_sources::AsyncSource;
-use common_pipeline_sources::AsyncSourcer;
-use common_storages_factory::Table;
+use chrono::DateTime;
+use databend_common_catalog::plan::DataSourcePlan;
+use databend_common_catalog::plan::PartStatistics;
+use databend_common_catalog::plan::Partitions;
+use databend_common_catalog::plan::PushDownInfo;
+use databend_common_catalog::table_args::TableArgs;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_catalog::table_function::TableFunction;
+use databend_common_exception::ErrorCode;
+pub use databend_common_exception::Result;
+use databend_common_exception::ToErrorCode;
+use databend_common_expression::types::DataType;
+use databend_common_expression::BlockEntry;
+use databend_common_expression::DataBlock;
+use databend_common_expression::Scalar;
+use databend_common_expression::TableDataType;
+use databend_common_expression::TableField;
+use databend_common_expression::TableSchemaRef;
+use databend_common_expression::TableSchemaRefExt;
+use databend_common_expression::Value;
+use databend_common_license::license::Feature;
+use databend_common_license::license::LicenseInfo;
+use databend_common_license::license_manager::LicenseManagerSwitch;
+use databend_common_meta_app::schema::TableIdent;
+use databend_common_meta_app::schema::TableInfo;
+use databend_common_meta_app::schema::TableMeta;
+use databend_common_pipeline_core::processors::OutputPort;
+use databend_common_pipeline_core::processors::ProcessorPtr;
+use databend_common_pipeline_core::Pipeline;
+use databend_common_pipeline_sources::AsyncSource;
+use databend_common_pipeline_sources::AsyncSourcer;
+use databend_common_storages_factory::Table;
 use humantime::Duration as HumanDuration;
 use jwt_simple::claims::JWTClaims;
 use jwt_simple::prelude::Clock;
@@ -69,6 +67,7 @@ impl LicenseInfoTable {
             TableField::new("expire_at", TableDataType::Timestamp),
             // formatted string calculate the available time from now to expiry of license
             TableField::new("available_time_until_expiry", TableDataType::String),
+            TableField::new("features", TableDataType::String),
         ])
     }
 
@@ -87,10 +86,8 @@ impl LicenseInfoTable {
                 engine: String::from(table_func_name),
                 // Assuming that created_on is unnecessary for function table,
                 // we could make created_on fixed to pass test_shuffle_action_try_into.
-                created_on: Utc
-                    .from_utc_datetime(&NaiveDateTime::from_timestamp_opt(0, 0).unwrap()),
-                updated_on: Utc
-                    .from_utc_datetime(&NaiveDateTime::from_timestamp_opt(0, 0).unwrap()),
+                created_on: DateTime::from_timestamp(0, 0).unwrap(),
+                updated_on: DateTime::from_timestamp(0, 0).unwrap(),
                 ..Default::default()
             },
             ..Default::default()
@@ -102,10 +99,6 @@ impl LicenseInfoTable {
 
 #[async_trait::async_trait]
 impl Table for LicenseInfoTable {
-    fn is_local(&self) -> bool {
-        true
-    }
-
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -134,6 +127,7 @@ impl Table for LicenseInfoTable {
         ctx: Arc<dyn TableContext>,
         _plan: &DataSourcePlan,
         pipeline: &mut Pipeline,
+        _put_cache: bool,
     ) -> Result<()> {
         pipeline.add_source(|output| LicenseInfoSource::create(ctx.clone(), output), 1)?;
         Ok(())
@@ -155,38 +149,26 @@ impl LicenseInfoSource {
         let available_time = info.expires_at.unwrap_or_default().sub(now).as_micros();
         let human_readable_available_time =
             HumanDuration::from(Duration::from_micros(available_time)).to_string();
+
+        let feature_str = info.custom.display_features();
         Ok(DataBlock::new(
             vec![
                 BlockEntry::new(
                     DataType::String,
                     Value::Scalar(Scalar::String(
-                        info.issuer
-                            .clone()
-                            .unwrap_or("".to_string())
-                            .into_bytes()
-                            .to_vec(),
+                        info.issuer.clone().unwrap_or("".to_string()),
                     )),
                 ),
                 BlockEntry::new(
                     DataType::String,
                     Value::Scalar(Scalar::String(
-                        info.custom
-                            .r#type
-                            .clone()
-                            .unwrap_or("".to_string())
-                            .into_bytes()
-                            .to_vec(),
+                        info.custom.r#type.clone().unwrap_or("".to_string()),
                     )),
                 ),
                 BlockEntry::new(
                     DataType::String,
                     Value::Scalar(Scalar::String(
-                        info.custom
-                            .org
-                            .clone()
-                            .unwrap_or("".to_string())
-                            .into_bytes()
-                            .to_vec(),
+                        info.custom.org.clone().unwrap_or("".to_string()),
                     )),
                 ),
                 BlockEntry::new(
@@ -203,9 +185,11 @@ impl LicenseInfoSource {
                 ),
                 BlockEntry::new(
                     DataType::String,
-                    Value::Scalar(Scalar::String(
-                        human_readable_available_time.into_bytes().to_vec(),
-                    )),
+                    Value::Scalar(Scalar::String(human_readable_available_time)),
+                ),
+                BlockEntry::new(
+                    DataType::String,
+                    Value::Scalar(Scalar::String(feature_str.to_string())),
                 ),
             ],
             1,
@@ -217,7 +201,6 @@ impl LicenseInfoSource {
 impl AsyncSource for LicenseInfoSource {
     const NAME: &'static str = "license_info";
 
-    #[async_trait::unboxed_simple]
     #[async_backtrace::framed]
     async fn generate(&mut self) -> Result<Option<DataBlock>> {
         if self.done {
@@ -227,24 +210,29 @@ impl AsyncSource for LicenseInfoSource {
 
         let settings = self.ctx.get_settings();
         // sync global changes on distributed node cluster.
-        settings.load_global_changes().await?;
-        let license = settings
-            .get_enterprise_license()
-            .map_err_to_code(ErrorCode::LicenseKeyInvalid, || {
-                format!("failed to get license for {}", self.ctx.get_tenant())
-            })?;
+        settings.load_changes().await?;
+        let license = unsafe {
+            settings.get_enterprise_license().map_err_to_code(
+                ErrorCode::LicenseKeyInvalid,
+                || {
+                    format!(
+                        "failed to get license for {}",
+                        self.ctx.get_tenant().display()
+                    )
+                },
+            )?
+        };
 
-        get_license_manager().manager.check_enterprise_enabled(
-            &settings,
-            self.ctx.get_tenant(),
-            Feature::LicenseInfo,
-        )?;
+        LicenseManagerSwitch::instance()
+            .check_enterprise_enabled(license.clone(), Feature::LicenseInfo)?;
 
-        let info = get_license_manager()
-            .manager
+        let info = LicenseManagerSwitch::instance()
             .parse_license(license.as_str())
             .map_err_to_code(ErrorCode::LicenseKeyInvalid, || {
-                format!("current license invalid for {}", self.ctx.get_tenant())
+                format!(
+                    "current license invalid for {}",
+                    self.ctx.get_tenant().display()
+                )
             })?;
         Ok(Some(self.to_block(&info)?))
     }

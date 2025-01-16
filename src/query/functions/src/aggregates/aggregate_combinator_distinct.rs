@@ -17,15 +17,15 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use common_arrow::arrow::bitmap::Bitmap;
-use common_exception::Result;
-use common_expression::types::number::NumberColumnBuilder;
-use common_expression::types::DataType;
-use common_expression::types::NumberDataType;
-use common_expression::with_number_mapped_type;
-use common_expression::Column;
-use common_expression::ColumnBuilder;
-use common_expression::Scalar;
+use databend_common_exception::Result;
+use databend_common_expression::types::number::NumberColumnBuilder;
+use databend_common_expression::types::Bitmap;
+use databend_common_expression::types::DataType;
+use databend_common_expression::types::NumberDataType;
+use databend_common_expression::with_number_mapped_type;
+use databend_common_expression::ColumnBuilder;
+use databend_common_expression::InputColumns;
+use databend_common_expression::Scalar;
 
 use super::aggregate_distinct_state::AggregateDistinctNumberState;
 use super::aggregate_distinct_state::AggregateDistinctState;
@@ -78,7 +78,7 @@ where State: DistinctStateFunc
     fn accumulate(
         &self,
         place: StateAddr,
-        columns: &[Column],
+        columns: InputColumns,
         validity: Option<&Bitmap>,
         input_rows: usize,
     ) -> Result<()> {
@@ -86,7 +86,7 @@ where State: DistinctStateFunc
         state.batch_add(columns, validity, input_rows)
     }
 
-    fn accumulate_row(&self, place: StateAddr, columns: &[Column], row: usize) -> Result<()> {
+    fn accumulate_row(&self, place: StateAddr, columns: InputColumns, row: usize) -> Result<()> {
         let state = place.get::<State>();
         state.add(columns, row)
     }
@@ -96,15 +96,17 @@ where State: DistinctStateFunc
         state.serialize(writer)
     }
 
-    fn deserialize(&self, place: StateAddr, reader: &mut &[u8]) -> Result<()> {
+    fn merge(&self, place: StateAddr, reader: &mut &[u8]) -> Result<()> {
         let state = place.get::<State>();
-        state.deserialize(reader)
+        let rhs = State::deserialize(reader)?;
+
+        state.merge(&rhs)
     }
 
-    fn merge(&self, place: StateAddr, rhs: StateAddr) -> Result<()> {
+    fn merge_states(&self, place: StateAddr, rhs: StateAddr) -> Result<()> {
         let state = place.get::<State>();
-        let rhs = rhs.get::<State>();
-        state.merge(rhs)
+        let other = rhs.get::<State>();
+        state.merge(other)
     }
 
     #[allow(unused_mut)]
@@ -127,10 +129,9 @@ where State: DistinctStateFunc
             if state.is_empty() {
                 return self.nested.merge_result(nested_place, builder);
             }
-            let columns = state.build_columns(&self.arguments).unwrap();
-
+            let columns = &state.build_columns(&self.arguments).unwrap();
             self.nested
-                .accumulate(nested_place, &columns, None, state.len())?;
+                .accumulate(nested_place, columns.into(), None, state.len())?;
             // merge_result
             self.nested.merge_result(nested_place, builder)
         }
@@ -151,7 +152,7 @@ where State: DistinctStateFunc
         }
     }
 
-    fn get_if_condition(&self, columns: &[Column]) -> Option<Bitmap> {
+    fn get_if_condition(&self, columns: InputColumns) -> Option<Bitmap> {
         self.nested.get_if_condition(columns)
     }
 }

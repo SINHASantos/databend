@@ -16,13 +16,13 @@ use std::alloc::Layout;
 use std::fmt;
 use std::sync::Arc;
 
-use common_arrow::arrow::bitmap::Bitmap;
-use common_exception::Result;
-use common_expression::types::AnyType;
-use common_expression::types::DataType;
-use common_expression::types::ValueType;
-use common_expression::Column;
-use common_expression::ColumnBuilder;
+use databend_common_exception::Result;
+use databend_common_expression::types::AnyType;
+use databend_common_expression::types::Bitmap;
+use databend_common_expression::types::DataType;
+use databend_common_expression::types::ValueType;
+use databend_common_expression::ColumnBuilder;
+use databend_common_expression::InputColumns;
 
 use super::aggregate_function::AggregateFunction;
 use super::StateAddr;
@@ -56,7 +56,7 @@ impl AggregateFunction for AggregateNullResultFunction {
     fn accumulate(
         &self,
         __place: StateAddr,
-        _columns: &[Column],
+        _columns: InputColumns,
         _validity: Option<&Bitmap>,
         _input_rows: usize,
     ) -> Result<()> {
@@ -67,13 +67,13 @@ impl AggregateFunction for AggregateNullResultFunction {
         &self,
         _places: &[StateAddr],
         _offset: usize,
-        _columns: &[Column],
+        _columns: InputColumns,
         _input_rows: usize,
     ) -> Result<()> {
         Ok(())
     }
 
-    fn accumulate_row(&self, _place: StateAddr, _columns: &[Column], _row: usize) -> Result<()> {
+    fn accumulate_row(&self, _place: StateAddr, _columns: InputColumns, _row: usize) -> Result<()> {
         Ok(())
     }
 
@@ -81,11 +81,11 @@ impl AggregateFunction for AggregateNullResultFunction {
         Ok(())
     }
 
-    fn deserialize(&self, _place: StateAddr, _reader: &mut &[u8]) -> Result<()> {
+    fn merge(&self, _place: StateAddr, _reader: &mut &[u8]) -> Result<()> {
         Ok(())
     }
 
-    fn merge(&self, _place: StateAddr, _rhs: StateAddr) -> Result<()> {
+    fn merge_states(&self, _place: StateAddr, _rhs: StateAddr) -> Result<()> {
         Ok(())
     }
 

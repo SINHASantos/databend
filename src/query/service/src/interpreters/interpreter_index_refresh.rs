@@ -14,43 +14,45 @@
 
 use std::sync::Arc;
 
-use aggregating_index::get_agg_index_handler;
-use common_base::runtime::GlobalIORuntime;
-use common_catalog::plan::DataSourcePlan;
-use common_catalog::plan::Partitions;
-use common_catalog::table_context::TableContext;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::infer_table_schema;
-use common_expression::DataField;
-use common_expression::DataSchemaRefExt;
-use common_expression::BLOCK_NAME_COL_NAME;
-use common_license::license::Feature;
-use common_license::license_manager::get_license_manager;
-use common_meta_app::schema::IndexMeta;
-use common_meta_app::schema::UpdateIndexReq;
-use common_pipeline_core::processors::processor::ProcessorPtr;
-use common_sql::evaluator::BlockOperator;
-use common_sql::evaluator::CompoundBlockOperator;
-use common_sql::executor::PhysicalPlan;
-use common_sql::executor::PhysicalPlanBuilder;
-use common_sql::executor::PhysicalPlanReplacer;
-use common_sql::plans::Plan;
-use common_sql::plans::RefreshIndexPlan;
-use common_sql::plans::RelOperator;
-use common_storages_fuse::operations::AggIndexSink;
-use common_storages_fuse::pruning::create_segment_location_vector;
-use common_storages_fuse::FuseLazyPartInfo;
-use common_storages_fuse::FusePartInfo;
-use common_storages_fuse::FuseTable;
-use common_storages_fuse::SegmentLocation;
-use opendal::Operator;
-use storages_common_table_meta::meta::Location;
+use databend_common_base::runtime::GlobalIORuntime;
+use databend_common_catalog::plan::DataSourcePlan;
+use databend_common_catalog::plan::Partitions;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::infer_schema_type;
+use databend_common_expression::DataField;
+use databend_common_expression::DataSchemaRefExt;
+use databend_common_expression::TableField;
+use databend_common_expression::TableSchema;
+use databend_common_expression::BLOCK_NAME_COL_NAME;
+use databend_common_license::license::Feature;
+use databend_common_license::license_manager::LicenseManagerSwitch;
+use databend_common_meta_app::schema::IndexMeta;
+use databend_common_meta_app::schema::UpdateIndexReq;
+use databend_common_pipeline_core::ExecutionInfo;
+use databend_common_pipeline_transforms::processors::TransformPipelineHelper;
+use databend_common_sql::evaluator::BlockOperator;
+use databend_common_sql::evaluator::CompoundBlockOperator;
+use databend_common_sql::executor::physical_plans::TableScan;
+use databend_common_sql::executor::PhysicalPlan;
+use databend_common_sql::executor::PhysicalPlanBuilder;
+use databend_common_sql::executor::PhysicalPlanReplacer;
+use databend_common_sql::plans::Plan;
+use databend_common_sql::plans::RefreshIndexPlan;
+use databend_common_sql::plans::RelOperator;
+use databend_common_storages_fuse::operations::AggIndexSink;
+use databend_common_storages_fuse::pruning::create_segment_location_vector;
+use databend_common_storages_fuse::FuseBlockPartInfo;
+use databend_common_storages_fuse::FuseLazyPartInfo;
+use databend_common_storages_fuse::FuseTable;
+use databend_common_storages_fuse::SegmentLocation;
+use databend_enterprise_aggregating_index::get_agg_index_handler;
+use databend_storages_common_table_meta::meta::Location;
 
 use crate::interpreters::Interpreter;
 use crate::pipelines::PipelineBuildResult;
 use crate::schedulers::build_query_pipeline_without_render_result_set;
-use crate::schedulers::ReplaceReadSource;
 use crate::sessions::QueryContext;
 
 pub struct RefreshIndexInterpreter {
@@ -68,7 +70,6 @@ impl RefreshIndexInterpreter {
         &self,
         plan: &DataSourcePlan,
         fuse_table: Arc<FuseTable>,
-        dal: Operator,
     ) -> Result<Option<Partitions>> {
         let snapshot_loc = plan.statistics.snapshot.clone();
         let mut lazy_init_segments = Vec::with_capacity(plan.parts.len());
@@ -84,12 +85,12 @@ impl RefreshIndexInterpreter {
         }
 
         if !lazy_init_segments.is_empty() {
-            let table_info = self.plan.table_info.clone();
+            let table_schema = self.plan.table_info.schema();
             let push_downs = plan.push_downs.clone();
             let ctx = self.ctx.clone();
 
             let (_statistics, partitions) = fuse_table
-                .prune_snapshot_blocks(ctx, dal, push_downs, table_info, lazy_init_segments, 0)
+                .prune_snapshot_blocks(ctx, push_downs, table_schema, lazy_init_segments, 0)
                 .await?;
 
             return Ok(Some(partitions));
@@ -103,15 +104,14 @@ impl RefreshIndexInterpreter {
         &self,
         plan: &DataSourcePlan,
         fuse_table: Arc<FuseTable>,
-        dal: Operator,
         segments: Vec<SegmentLocation>,
     ) -> Result<Option<Partitions>> {
-        let table_info = self.plan.table_info.clone();
+        let table_schema = self.plan.table_info.schema();
         let push_downs = plan.push_downs.clone();
         let ctx = self.ctx.clone();
 
         let (_statistics, partitions) = fuse_table
-            .prune_snapshot_blocks(ctx, dal, push_downs, table_info, segments, 0)
+            .prune_snapshot_blocks(ctx, push_downs, table_schema, segments, 0)
             .await?;
 
         Ok(Some(partitions))
@@ -122,7 +122,6 @@ impl RefreshIndexInterpreter {
         &self,
         query_plan: &PhysicalPlan,
         fuse_table: Arc<FuseTable>,
-        dal: Operator,
         segments: Option<Vec<Location>>,
     ) -> Result<Option<DataSourcePlan>> {
         let mut source = vec![];
@@ -148,17 +147,12 @@ impl RefreshIndexInterpreter {
         } else {
             let mut source = source.remove(0);
             let partitions = match segments {
-                Some(segment_locs) => {
+                Some(segment_locs) if !segment_locs.is_empty() => {
                     let segment_locations = create_segment_location_vector(segment_locs, None);
-                    self.get_partitions_with_given_segments(
-                        &source,
-                        fuse_table,
-                        dal,
-                        segment_locations,
-                    )
-                    .await?
+                    self.get_partitions_with_given_segments(&source, fuse_table, segment_locations)
+                        .await?
                 }
-                None => self.get_partitions(&source, fuse_table, dal).await?,
+                Some(_) | None => self.get_partitions(&source, fuse_table).await?,
             };
             if let Some(parts) = partitions {
                 source.parts = parts;
@@ -166,21 +160,22 @@ impl RefreshIndexInterpreter {
 
             // first, sort the partitions by create_on.
             source.parts.partitions.sort_by(|p1, p2| {
-                let p1 = FusePartInfo::from_part(p1).unwrap();
-                let p2 = FusePartInfo::from_part(p2).unwrap();
+                let p1 = FuseBlockPartInfo::from_part(p1).unwrap();
+                let p2 = FuseBlockPartInfo::from_part(p2).unwrap();
                 p1.create_on.partial_cmp(&p2.create_on).unwrap()
             });
 
             // then, find the last refresh position.
-            let last = match source.parts.partitions.binary_search_by(|p| {
-                let fp = FusePartInfo::from_part(p).unwrap();
-                fp.create_on
-                    .partial_cmp(&self.plan.index_meta.updated_on)
-                    .unwrap()
-            }) {
-                Ok(i) => i + 1,
-                Err(i) => i,
-            };
+            let last = source
+                .parts
+                .partitions
+                .binary_search_by(|p| {
+                    let fp = FuseBlockPartInfo::from_part(p).unwrap();
+                    fp.create_on
+                        .partial_cmp(&self.plan.index_meta.updated_on)
+                        .unwrap()
+                })
+                .map_or_else(|i| i, |i| i + 1);
 
             // finally, skip the refreshed partitions.
             source.parts.partitions = match self.plan.limit {
@@ -200,7 +195,7 @@ impl RefreshIndexInterpreter {
     }
 
     fn update_index_meta(&self, read_source: &DataSourcePlan) -> Result<IndexMeta> {
-        let fuse_part = FusePartInfo::from_part(read_source.parts.partitions.last().unwrap())?;
+        let fuse_part = FuseBlockPartInfo::from_part(read_source.parts.partitions.last().unwrap())?;
         let mut index_meta = self.plan.index_meta.clone();
         index_meta.updated_on = fuse_part.create_on;
         Ok(index_meta)
@@ -213,14 +208,14 @@ impl Interpreter for RefreshIndexInterpreter {
         "RefreshIndexInterpreter"
     }
 
+    fn is_ddl(&self) -> bool {
+        true
+    }
+
     #[async_backtrace::framed]
     async fn execute2(&self) -> Result<PipelineBuildResult> {
-        let license_manager = get_license_manager();
-        license_manager.manager.check_enterprise_enabled(
-            &self.ctx.get_settings(),
-            self.ctx.get_tenant(),
-            Feature::AggregateIndex,
-        )?;
+        LicenseManagerSwitch::instance()
+            .check_enterprise_enabled(self.ctx.get_license_key(), Feature::AggregateIndex)?;
         let (mut query_plan, output_schema, select_columns) = match self.plan.query_plan.as_ref() {
             Plan::Query {
                 s_expr,
@@ -261,7 +256,6 @@ impl Interpreter for RefreshIndexInterpreter {
             }
         };
 
-        let data_accessor = self.ctx.get_data_operator()?;
         let fuse_table = FuseTable::do_create(self.plan.table_info.clone())?;
         let fuse_table: Arc<FuseTable> = fuse_table.into();
 
@@ -270,7 +264,6 @@ impl Interpreter for RefreshIndexInterpreter {
             .get_read_source(
                 &query_plan,
                 fuse_table.clone(),
-                data_accessor.operator(),
                 self.plan.segment_locs.clone(),
             )
             .await?;
@@ -285,13 +278,13 @@ impl Interpreter for RefreshIndexInterpreter {
 
         let new_index_meta = self.update_index_meta(&new_read_source)?;
 
-        let mut replace_read_source = ReplaceReadSource {
+        let mut replace_read_source = ReadSourceReplacer {
             source: new_read_source,
         };
         query_plan = replace_read_source.replace(&query_plan)?;
 
         let mut build_res =
-            build_query_pipeline_without_render_result_set(&self.ctx, &query_plan, false).await?;
+            build_query_pipeline_without_render_result_set(&self.ctx, &query_plan).await?;
 
         let input_schema = query_plan.output_schema()?;
 
@@ -303,17 +296,15 @@ impl Interpreter for RefreshIndexInterpreter {
         }
         let num_input_columns = input_schema.num_fields();
         let func_ctx = self.ctx.get_function_context()?;
-        build_res.main_pipeline.add_transform(|input, output| {
-            Ok(ProcessorPtr::create(CompoundBlockOperator::create(
-                input,
-                output,
-                num_input_columns,
-                func_ctx.clone(),
+        build_res.main_pipeline.add_transformer(|| {
+            CompoundBlockOperator::new(
                 vec![BlockOperator::Project {
                     projection: projections.clone(),
                 }],
-            )))
-        })?;
+                func_ctx.clone(),
+                num_input_columns,
+            )
+        });
 
         // Find the block name column offset in the block.
         let block_name_col = select_columns
@@ -321,27 +312,38 @@ impl Interpreter for RefreshIndexInterpreter {
             .find(|col| col.column_name.eq_ignore_ascii_case(BLOCK_NAME_COL_NAME))
             .ok_or_else(|| {
                 ErrorCode::Internal(
-                    "_block_name should contained in the input of refresh processor",
+                    "_block_name should be contained in the input of refresh processor",
                 )
             })?;
         let block_name_offset = output_schema.index_of(&block_name_col.index.to_string())?;
 
+        let fields = output_schema
+            .fields()
+            .iter()
+            .map(|f| {
+                let pos = select_columns
+                    .iter()
+                    .find(|col| col.index.to_string().eq_ignore_ascii_case(f.name()))
+                    .ok_or_else(|| ErrorCode::Internal("should find the corresponding column"))?;
+                let field_type = infer_schema_type(f.data_type())?;
+                Ok(TableField::new(&pos.column_name, field_type))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
         // Build the final sink schema.
-        let mut sink_schema = infer_table_schema(&output_schema)?.as_ref().clone();
+        let mut sink_schema = TableSchema::new(fields);
         if !self.plan.user_defined_block_name {
-            sink_schema.drop_column(&block_name_col.index.to_string())?;
+            sink_schema.drop_column(&block_name_col.column_name)?;
         }
         let sink_schema = Arc::new(sink_schema);
-
-        let write_settings = fuse_table.get_write_settings();
 
         build_res.main_pipeline.try_resize(1)?;
         build_res.main_pipeline.add_sink(|input| {
             AggIndexSink::try_create(
                 input,
-                data_accessor.operator(),
+                fuse_table.get_operator(),
                 self.plan.index_id,
-                write_settings.clone(),
+                fuse_table.get_write_settings(),
                 sink_schema.clone(),
                 block_name_offset,
                 self.plan.user_defined_block_name,
@@ -349,18 +351,19 @@ impl Interpreter for RefreshIndexInterpreter {
         })?;
 
         let ctx = self.ctx.clone();
+        let tenant = ctx.get_tenant();
         let req = UpdateIndexReq {
+            tenant,
             index_id: self.plan.index_id,
-            index_name: self.plan.index_name.clone(),
             index_meta: new_index_meta,
         };
 
         build_res
             .main_pipeline
-            .set_on_finished(move |may_error| match may_error {
-                None => GlobalIORuntime::instance()
+            .set_on_finished(move |info: &ExecutionInfo| match &info.res {
+                Ok(_) => GlobalIORuntime::instance()
                     .block_on(async move { modify_last_update(ctx, req).await }),
-                Some(error_code) => Err(error_code.clone()),
+                Err(error_code) => Err(error_code.clone()),
             });
 
         return Ok(build_res);
@@ -372,4 +375,16 @@ async fn modify_last_update(ctx: Arc<QueryContext>, req: UpdateIndexReq) -> Resu
     let handler = get_agg_index_handler();
     let _ = handler.do_update_index(catalog, req).await?;
     Ok(())
+}
+
+struct ReadSourceReplacer {
+    source: DataSourcePlan,
+}
+
+impl PhysicalPlanReplacer for ReadSourceReplacer {
+    fn replace_table_scan(&mut self, plan: &TableScan) -> Result<PhysicalPlan> {
+        let mut plan = plan.clone();
+        plan.source = Box::new(self.source.clone());
+        Ok(PhysicalPlan::TableScan(plan))
+    }
 }

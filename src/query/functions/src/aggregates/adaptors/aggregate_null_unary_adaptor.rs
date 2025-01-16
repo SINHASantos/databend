@@ -16,13 +16,13 @@ use std::alloc::Layout;
 use std::fmt;
 use std::sync::Arc;
 
-use common_arrow::arrow::bitmap::Bitmap;
-use common_exception::Result;
-use common_expression::types::DataType;
-use common_expression::utils::column_merge_validity;
-use common_expression::Column;
-use common_expression::ColumnBuilder;
-use common_io::prelude::BinaryWrite;
+use databend_common_exception::Result;
+use databend_common_expression::types::Bitmap;
+use databend_common_expression::types::DataType;
+use databend_common_expression::utils::column_merge_validity;
+use databend_common_expression::ColumnBuilder;
+use databend_common_expression::InputColumns;
+use databend_common_io::prelude::BinaryWrite;
 
 use crate::aggregates::AggregateFunction;
 use crate::aggregates::AggregateFunctionRef;
@@ -94,6 +94,10 @@ impl<const NULLABLE_RESULT: bool> AggregateFunction for AggregateNullUnaryAdapto
         self.nested.init_state(place);
     }
 
+    fn serialize_size_per_row(&self) -> Option<usize> {
+        self.nested.serialize_size_per_row().map(|row| row + 1)
+    }
+
     #[inline]
     fn state_layout(&self) -> Layout {
         let layout = self.nested.state_layout();
@@ -105,20 +109,22 @@ impl<const NULLABLE_RESULT: bool> AggregateFunction for AggregateNullUnaryAdapto
     fn accumulate(
         &self,
         place: StateAddr,
-        columns: &[Column],
+        columns: InputColumns,
         validity: Option<&Bitmap>,
         input_rows: usize,
     ) -> Result<()> {
         let col = &columns[0];
         let validity = column_merge_validity(col, validity.cloned());
-        let not_null_column = col.remove_nullable();
+        let not_null_column = &[col.remove_nullable()];
+        let not_null_column = not_null_column.into();
+        let validity = Bitmap::map_all_sets_to_none(validity);
 
         self.nested
-            .accumulate(place, &[not_null_column], validity.as_ref(), input_rows)?;
+            .accumulate(place, not_null_column, validity.as_ref(), input_rows)?;
 
         if validity
             .as_ref()
-            .map(|c| c.unset_bits() != input_rows)
+            .map(|c| c.null_count() != input_rows)
             .unwrap_or(true)
         {
             self.set_flag(place, 1);
@@ -131,18 +137,18 @@ impl<const NULLABLE_RESULT: bool> AggregateFunction for AggregateNullUnaryAdapto
         &self,
         places: &[StateAddr],
         offset: usize,
-        columns: &[Column],
+        columns: InputColumns,
         input_rows: usize,
     ) -> Result<()> {
         let col = &columns[0];
         let validity = column_merge_validity(col, None);
-        let not_null_columns = vec![col.remove_nullable()];
-        let not_null_columns = &not_null_columns;
+        let not_null_columns = &[col.remove_nullable()];
+        let not_null_columns = not_null_columns.into();
 
         match validity {
-            Some(v) if v.unset_bits() > 0 => {
+            Some(v) if v.null_count() > 0 => {
                 // all nulls
-                if v.unset_bits() == v.len() {
+                if v.null_count() == v.len() {
                     return Ok(());
                 }
 
@@ -166,16 +172,16 @@ impl<const NULLABLE_RESULT: bool> AggregateFunction for AggregateNullUnaryAdapto
         Ok(())
     }
 
-    fn accumulate_row(&self, place: StateAddr, columns: &[Column], row: usize) -> Result<()> {
+    fn accumulate_row(&self, place: StateAddr, columns: InputColumns, row: usize) -> Result<()> {
         let col = &columns[0];
         let validity = column_merge_validity(col, None);
-        let not_null_columns = vec![col.remove_nullable()];
-        let not_null_columns = &not_null_columns;
+        let not_null_columns = &[col.remove_nullable()];
+        let not_null_columns = not_null_columns.into();
 
         match validity {
-            Some(v) if v.unset_bits() > 0 => {
+            Some(v) if v.null_count() > 0 => {
                 // all nulls
-                if v.unset_bits() == v.len() {
+                if v.null_count() == v.len() {
                     return Ok(());
                 }
 
@@ -202,20 +208,26 @@ impl<const NULLABLE_RESULT: bool> AggregateFunction for AggregateNullUnaryAdapto
         Ok(())
     }
 
-    fn deserialize(&self, place: StateAddr, reader: &mut &[u8]) -> Result<()> {
+    fn merge(&self, place: StateAddr, reader: &mut &[u8]) -> Result<()> {
+        if self.get_flag(place) == 0 {
+            // initial the state to remove the dirty stats
+            self.init_state(place);
+        }
+
         if NULLABLE_RESULT {
             let flag = reader[reader.len() - 1];
-            self.nested
-                .deserialize(place, &mut &reader[..reader.len() - 1])?;
-            self.set_flag(place, flag);
+            if flag == 1 {
+                self.set_flag(place, 1);
+                self.nested.merge(place, &mut &reader[..reader.len() - 1])?;
+            }
         } else {
-            self.nested.deserialize(place, reader)?;
+            self.nested.merge(place, reader)?;
         }
 
         Ok(())
     }
 
-    fn merge(&self, place: StateAddr, rhs: StateAddr) -> Result<()> {
+    fn merge_states(&self, place: StateAddr, rhs: StateAddr) -> Result<()> {
         if self.get_flag(place) == 0 {
             // initial the state to remove the dirty stats
             self.init_state(place);
@@ -223,7 +235,7 @@ impl<const NULLABLE_RESULT: bool> AggregateFunction for AggregateNullUnaryAdapto
 
         if self.get_flag(rhs) == 1 {
             self.set_flag(place, 1);
-            self.nested.merge(place, rhs)?;
+            self.nested.merge_states(place, rhs)?;
         }
 
         Ok(())
@@ -260,7 +272,7 @@ impl<const NULLABLE_RESULT: bool> AggregateFunction for AggregateNullUnaryAdapto
         self.nested.convert_const_to_full()
     }
 
-    fn get_if_condition(&self, columns: &[Column]) -> Option<Bitmap> {
+    fn get_if_condition(&self, columns: InputColumns) -> Option<Bitmap> {
         self.nested.get_if_condition(columns)
     }
 }

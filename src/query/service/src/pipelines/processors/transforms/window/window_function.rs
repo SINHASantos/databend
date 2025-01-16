@@ -14,21 +14,20 @@
 
 use std::sync::Arc;
 
-use common_exception::Result;
-use common_expression::types::DataType;
-use common_expression::types::NumberDataType;
-use common_expression::Column;
-use common_expression::ColumnBuilder;
-use common_expression::DataBlock;
-use common_expression::DataSchema;
-use common_functions::aggregates::get_layout_offsets;
-use common_functions::aggregates::AggregateFunction;
-use common_functions::aggregates::AggregateFunctionFactory;
-use common_functions::aggregates::StateAddr;
-use common_sql::executor::LagLeadDefault;
-use common_sql::executor::WindowFunction;
-
-use crate::pipelines::processors::transforms::group_by::Area;
+use databend_common_base::runtime::drop_guard;
+use databend_common_exception::Result;
+use databend_common_expression::types::DataType;
+use databend_common_expression::types::NumberDataType;
+use databend_common_expression::ColumnBuilder;
+use databend_common_expression::DataBlock;
+use databend_common_expression::DataSchema;
+use databend_common_expression::InputColumns;
+use databend_common_functions::aggregates::get_layout_offsets;
+use databend_common_functions::aggregates::AggregateFunction;
+use databend_common_functions::aggregates::AggregateFunctionFactory;
+use databend_common_functions::aggregates::StateAddr;
+use databend_common_sql::executor::physical_plans::LagLeadDefault;
+use databend_common_sql::executor::physical_plans::WindowFunction;
 
 #[derive(Clone)]
 pub enum WindowFunctionInfo {
@@ -44,9 +43,10 @@ pub enum WindowFunctionInfo {
     CumeDist,
 }
 
+type Arena = bumpalo::Bump;
 pub struct WindowFuncAggImpl {
     // Need to hold arena until `drop`.
-    _arena: Area,
+    _arena: Arena,
     agg: Arc<dyn AggregateFunction>,
     place: StateAddr,
     args: Vec<usize>,
@@ -59,21 +59,12 @@ impl WindowFuncAggImpl {
     }
 
     #[inline]
-    pub fn arg_columns(&self, data: &DataBlock) -> Vec<Column> {
-        self.args
-            .iter()
-            .map(|index| {
-                data.get_by_offset(*index)
-                    .value
-                    .as_column()
-                    .cloned()
-                    .unwrap()
-            })
-            .collect()
+    pub fn arg_columns<'a>(&'a self, data: &'a DataBlock) -> InputColumns {
+        InputColumns::new_block_proxy(&self.args, data)
     }
 
     #[inline]
-    pub fn accumulate_row(&self, args: &[Column], row: usize) -> Result<()> {
+    pub fn accumulate_row(&self, args: InputColumns, row: usize) -> Result<()> {
         self.agg.accumulate_row(self.place, args, row)
     }
 
@@ -85,11 +76,13 @@ impl WindowFuncAggImpl {
 
 impl Drop for WindowFuncAggImpl {
     fn drop(&mut self) {
-        if self.agg.need_manual_drop_state() {
-            unsafe {
-                self.agg.drop_state(self.place);
+        drop_guard(move || {
+            if self.agg.need_manual_drop_state() {
+                unsafe {
+                    self.agg.drop_state(self.place);
+                }
             }
-        }
+        })
     }
 }
 
@@ -105,6 +98,7 @@ pub struct WindowFuncNthValueImpl {
     pub n: Option<u64>,
     pub arg: usize,
     pub return_type: DataType,
+    pub ignore_null: bool,
 }
 
 #[derive(Clone)]
@@ -188,7 +182,7 @@ impl WindowFunctionInfo {
                     agg.sig.args.clone(),
                 )?;
                 let args = agg
-                    .args
+                    .arg_indices
                     .iter()
                     .map(|p| {
                         let offset = schema.index_of(&p.to_string())?;
@@ -222,6 +216,7 @@ impl WindowFunctionInfo {
                     n: func.n,
                     arg: new_arg,
                     return_type: func.return_type.clone(),
+                    ignore_null: func.ignore_null,
                 })
             }
             WindowFunction::Ntile(func) => Self::Ntile(WindowFuncNtileImpl {
@@ -237,7 +232,7 @@ impl WindowFunctionImpl {
     pub(crate) fn try_create(window: WindowFunctionInfo) -> Result<Self> {
         Ok(match window {
             WindowFunctionInfo::Aggregate(agg, args) => {
-                let mut arena = Area::create();
+                let arena = Arena::new();
                 let mut state_offset = Vec::with_capacity(1);
                 let layout = get_layout_offsets(&[agg.clone()], &mut state_offset)?;
                 let place: StateAddr = arena.alloc_layout(layout).into();

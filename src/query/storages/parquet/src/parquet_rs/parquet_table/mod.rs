@@ -14,7 +14,7 @@
 
 mod partition;
 mod read;
+mod stats;
 mod table;
 
-pub use partition::ParquetRSPart;
 pub use table::ParquetRSTable;

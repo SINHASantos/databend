@@ -13,11 +13,15 @@
 // limitations under the License.
 
 mod async_crash_me;
+mod cloud;
 mod infer_schema;
+mod inspect_parquet;
 mod list_stage;
 mod numbers;
 mod openai;
 mod others;
+mod show_grants;
+mod show_variables;
 mod srf;
 mod sync_crash_me;
 mod table_function;

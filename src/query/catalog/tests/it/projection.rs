@@ -14,13 +14,13 @@
 
 use std::collections::BTreeMap;
 
-use common_catalog::plan::Projection;
-use common_exception::Result;
-use common_expression::types::NumberDataType;
-use common_expression::TableDataType;
-use common_expression::TableField;
-use common_expression::TableSchema;
-use parquet_rs::arrow::arrow_to_parquet_schema;
+use databend_common_catalog::plan::Projection;
+use databend_common_exception::Result;
+use databend_common_expression::types::NumberDataType;
+use databend_common_expression::TableDataType;
+use databend_common_expression::TableField;
+use databend_common_expression::TableSchema;
+use parquet::arrow::arrow_to_parquet_schema;
 
 #[test]
 fn test_to_projection_mask() -> Result<()> {
@@ -53,13 +53,7 @@ fn test_to_projection_mask() -> Result<()> {
         }),
         TableField::new("h", TableDataType::String),
     ]);
-    let arrow_fields = schema.to_arrow().fields;
-    let arrow_schema = arrow_schema::Schema::new(
-        arrow_fields
-            .into_iter()
-            .map(arrow_schema::Field::from)
-            .collect::<Vec<_>>(),
-    );
+    let arrow_schema = (&schema).into();
     let schema_desc = arrow_to_parquet_schema(&arrow_schema)?;
 
     // (Projection, ProjectionMask)
@@ -113,7 +107,7 @@ fn test_to_projection_mask() -> Result<()> {
     ];
 
     for (projection, expected_mask) in test_cases.iter() {
-        let mask = projection.to_arrow_projection(&schema_desc);
+        let (mask, _) = projection.to_arrow_projection(&schema_desc);
         for leaf in expected_mask {
             assert!(
                 mask.leaf_included(*leaf),

@@ -16,15 +16,15 @@ use std::any::Any;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use common_exception::Result;
-use common_expression::DataBlock;
-use common_pipeline_core::processors::port::InputPort;
-use common_pipeline_core::processors::port::OutputPort;
-use common_pipeline_core::processors::processor::Event;
-use common_pipeline_core::processors::Processor;
-use common_pipeline_sinks::Sink;
+use databend_common_exception::Result;
+use databend_common_expression::DataBlock;
+use databend_common_pipeline_core::processors::Event;
+use databend_common_pipeline_core::processors::InputPort;
+use databend_common_pipeline_core::processors::OutputPort;
+use databend_common_pipeline_core::processors::Processor;
+use databend_common_pipeline_sinks::Sink;
 
-use crate::pipelines::processors::transforms::RangeJoinState;
+use crate::pipelines::processors::transforms::range_join::RangeJoinState;
 
 enum RangeJoinStep {
     Sink,
@@ -136,7 +136,7 @@ impl Processor for TransformRangeJoinLeft {
                 if let Some(task_id) = task_id {
                     let res = match self.state.ie_join_state {
                         Some(ref _ie_join_state) => self.state.ie_join(task_id)?,
-                        None => self.state.merge_join(task_id)?,
+                        None => self.state.range_join(task_id)?,
                     };
                     for block in res {
                         if !block.is_empty() {
@@ -152,6 +152,7 @@ impl Processor for TransformRangeJoinLeft {
         Ok(())
     }
 
+    #[async_backtrace::framed]
     async fn async_process(&mut self) -> Result<()> {
         if let RangeJoinStep::Merging = self.step {
             self.state.wait_merge_finish().await?;

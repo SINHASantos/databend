@@ -14,29 +14,22 @@
 
 use std::sync::Arc;
 
-use common_base::base::tokio::sync::Semaphore;
-use common_catalog::table::Table;
-use common_catalog::table_context::TableContext;
-use common_exception::Result;
-use common_expression::FieldIndex;
-use common_pipeline_core::pipe::PipeItem;
-use common_pipeline_core::processors::processor::ProcessorPtr;
-use common_pipeline_transforms::processors::transforms::AsyncAccumulatingTransformer;
-use common_sql::executor::MutationKind;
-use common_sql::executor::OnConflictField;
+use databend_common_base::base::tokio::sync::Semaphore;
+use databend_common_catalog::table::Table;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::Result;
+use databend_common_expression::FieldIndex;
+use databend_common_pipeline_core::PipeItem;
+use databend_common_sql::executor::physical_plans::OnConflictField;
+use databend_storages_common_index::BloomIndex;
+use databend_storages_common_io::ReadSettings;
+use databend_storages_common_table_meta::meta::BlockSlotDescription;
+use databend_storages_common_table_meta::meta::Location;
 use rand::prelude::SliceRandom;
-use storages_common_index::BloomIndex;
-use storages_common_table_meta::meta::Location;
-use storages_common_table_meta::meta::TableSnapshot;
 
 use crate::io::BlockBuilder;
-use crate::io::ReadSettings;
-use crate::operations::common::CommitSink;
-use crate::operations::common::MutationGenerator;
-use crate::operations::common::TableMutationAggregator;
 use crate::operations::mutation::SegmentIndex;
 use crate::operations::replace_into::MergeIntoOperationAggregator;
-use crate::pipelines::Pipeline;
 use crate::FuseTable;
 
 impl FuseTable {
@@ -102,6 +95,7 @@ impl FuseTable {
         on_conflicts: Vec<OnConflictField>,
         bloom_filter_column_indexes: Vec<FieldIndex>,
         segments: &[(usize, Location)],
+        block_slots: Option<BlockSlotDescription>,
         io_request_semaphore: Arc<Semaphore>,
     ) -> Result<Vec<PipeItem>> {
         let chunks = Self::partition_segments(segments, num_partition);
@@ -113,10 +107,9 @@ impl FuseTable {
                 on_conflicts.clone(),
                 bloom_filter_column_indexes.clone(),
                 chunk_of_segment_locations,
-                self.operator.clone(),
-                self.table_info.schema(),
-                self.get_write_settings(),
-                read_settings.clone(),
+                block_slots.clone(),
+                self,
+                read_settings,
                 block_builder.clone(),
                 io_request_semaphore.clone(),
             )?;
@@ -150,60 +143,16 @@ impl FuseTable {
         chunks
     }
 
-    pub fn chain_mutation_pipes(
-        &self,
-        ctx: &Arc<dyn TableContext>,
-        pipeline: &mut Pipeline,
-        base_snapshot: Arc<TableSnapshot>,
-        mutation_kind: MutationKind,
-    ) -> Result<()> {
-        // resize
-        pipeline.try_resize(1)?;
-
-        // a) append TableMutationAggregator
-        pipeline.add_transform(|input, output| {
-            let base_segments = base_snapshot.segments.clone();
-            let base_summary = base_snapshot.summary.clone();
-            let mutation_aggregator = TableMutationAggregator::create(
-                self,
-                ctx.clone(),
-                base_segments,
-                base_summary,
-                mutation_kind,
-            );
-            Ok(ProcessorPtr::create(AsyncAccumulatingTransformer::create(
-                input,
-                output,
-                mutation_aggregator,
-            )))
-        })?;
-
-        // b) append  CommitSink
-        let snapshot_gen = MutationGenerator::new(base_snapshot);
-        pipeline.add_sink(|input| {
-            CommitSink::try_create(
-                self,
-                ctx.clone(),
-                None,
-                snapshot_gen.clone(),
-                input,
-                None,
-                false,
-                None,
-            )
-        })?;
-        Ok(())
-    }
-
     // choose the bloom filter columns (from on-conflict fields).
     // columns with larger number of number-of-distinct-values, will be kept, is their types
     // are supported by bloom index.
     pub async fn choose_bloom_filter_columns(
         &self,
+        ctx: Arc<dyn TableContext>,
         on_conflicts: &[OnConflictField],
         max_num_columns: u64,
     ) -> Result<Vec<FieldIndex>> {
-        let col_stats_provider = self.column_statistics_provider().await?;
+        let col_stats_provider = self.column_statistics_provider(ctx).await?;
         let mut cols = on_conflicts
             .iter()
             .enumerate()

@@ -14,15 +14,19 @@
 
 use std::sync::Arc;
 
-use common_catalog::plan::DataSourcePlan;
-use common_catalog::table_context::TableContext;
-use common_exception::Result;
-use common_expression::TableSchemaRef;
-use common_pipeline_core::Pipeline;
+use databend_common_catalog::plan::DataSourcePlan;
+use databend_common_catalog::table::Table;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::Result;
+use databend_common_expression::TableSchemaRef;
+use databend_common_pipeline_core::Pipeline;
 
 use super::ParquetRSTable;
 use crate::parquet_rs::source::ParquetSource;
-use crate::ParquetRSReader;
+use crate::utils::calc_parallelism;
+use crate::ParquetPart;
+use crate::ParquetRSPruner;
+use crate::ParquetRSReaderBuilder;
 
 impl ParquetRSTable {
     #[inline]
@@ -32,24 +36,68 @@ impl ParquetRSTable {
         plan: &DataSourcePlan,
         pipeline: &mut Pipeline,
     ) -> Result<()> {
-        let parts_len = plan.parts.len();
-        let max_threads = ctx.get_settings().get_max_threads()? as usize;
-        let max_threads = std::cmp::min(parts_len, max_threads);
-
         let table_schema: TableSchemaRef = self.table_info.schema();
-        let reader = Arc::new(ParquetRSReader::create(
-            self.operator.clone(),
-            &table_schema,
-            &self.arrow_schema,
-            plan,
-        )?);
+        // If there is a `ParquetFilesPart`, we should create pruner for it.
+        // Although `ParquetFilesPart`s are always staying at the end of `parts` when `do_read_partitions`,
+        // but parts are reshuffled when `redistribute_source_fragment`, so let us check all of them.
+        let has_files_part = plan.parts.partitions.iter().any(|p| {
+            matches!(
+                p.as_any().downcast_ref::<ParquetPart>().unwrap(),
+                ParquetPart::ParquetFiles(_)
+            )
+        });
+        let pruner = if has_files_part {
+            Some(ParquetRSPruner::try_create(
+                ctx.get_function_context()?,
+                table_schema.clone(),
+                self.leaf_fields.clone(),
+                &plan.push_downs,
+                self.read_options,
+                vec![],
+            )?)
+        } else {
+            None
+        };
 
-        // TODO(parquet):
-        // - introduce Top-K optimization.
-        // - adjust parallelism by data sizes.
+        let num_threads = calc_parallelism(&ctx, plan)?;
+
+        let topk = plan
+            .push_downs
+            .as_ref()
+            .and_then(|p| p.top_k(&self.schema()));
+
+        let mut builder = ParquetRSReaderBuilder::create_with_parquet_schema(
+            ctx.clone(),
+            self.operator.clone(),
+            table_schema.clone(),
+            self.schema_descr.clone(),
+            Some(self.arrow_schema.clone()),
+            Some(self.schema_from.clone()),
+        )
+        .with_options(self.read_options)
+        .with_push_downs(plan.push_downs.as_ref())
+        .with_pruner(pruner)
+        .with_topk(topk.as_ref());
+
+        let row_group_reader = Arc::new(builder.build_row_group_reader()?);
+        let full_file_reader = if has_files_part {
+            Some(Arc::new(builder.build_full_reader()?))
+        } else {
+            None
+        };
+
+        let topk = Arc::new(topk);
         pipeline.add_source(
-            |output| ParquetSource::create(ctx.clone(), output, reader.clone()),
-            max_threads.max(1),
+            |output| {
+                ParquetSource::create(
+                    ctx.clone(),
+                    output,
+                    row_group_reader.clone(),
+                    full_file_reader.clone(),
+                    topk.clone(),
+                )
+            },
+            num_threads,
         )
     }
 }

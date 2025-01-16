@@ -14,14 +14,17 @@
 
 use std::sync::Arc;
 
-use common_catalog::table_context::TableContext;
-use common_exception::Result;
-use common_expression::types::NumberType;
-use common_expression::types::ValueType;
-use common_expression::Column;
-use common_expression::DataSchemaRef;
-use common_functions::aggregates::eval_aggr;
-use common_storage::Datum;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::types::NumberType;
+use databend_common_expression::types::ValueType;
+use databend_common_expression::Column;
+use databend_common_expression::ColumnBuilder;
+use databend_common_expression::DataSchemaRef;
+use databend_common_functions::aggregates::eval_aggr;
+use databend_common_storage::Datum;
+use databend_common_storage::DEFAULT_HISTOGRAM_BUCKETS;
 use itertools::Itertools;
 
 use crate::optimizer::histogram_from_ndv;
@@ -35,7 +38,6 @@ use crate::optimizer::RelationalProperty;
 use crate::optimizer::RequiredProperty;
 use crate::optimizer::StatInfo;
 use crate::optimizer::Statistics;
-use crate::optimizer::DEFAULT_HISTOGRAM_BUCKETS;
 use crate::plans::Operator;
 use crate::plans::RelOp;
 
@@ -49,6 +51,24 @@ pub struct ConstantTableScan {
 }
 
 impl ConstantTableScan {
+    pub fn new_empty_scan(schema: DataSchemaRef, columns: ColumnSet) -> Self {
+        let values = schema
+            .fields
+            .iter()
+            .map(|f| {
+                let builder = ColumnBuilder::with_capacity(f.data_type(), 0);
+                builder.build()
+            })
+            .collect::<Vec<_>>();
+
+        Self {
+            values,
+            num_rows: 0,
+            schema,
+            columns,
+        }
+    }
+
     pub fn prune_columns(&self, columns: ColumnSet) -> Self {
         let mut projection = columns
             .iter()
@@ -72,6 +92,14 @@ impl ConstantTableScan {
 
     pub fn used_columns(&self) -> Result<ColumnSet> {
         Ok(self.columns.clone())
+    }
+
+    pub fn name(&self) -> &str {
+        if self.num_rows == 0 {
+            "EmptyResultScan"
+        } else {
+            "ConstantTableScan"
+        }
     }
 }
 
@@ -105,21 +133,27 @@ impl Operator for ConstantTableScan {
         RelOp::ConstantTableScan
     }
 
+    fn arity(&self) -> usize {
+        0
+    }
+
     fn derive_relational_prop(&self, _rel_expr: &RelExpr) -> Result<Arc<RelationalProperty>> {
         Ok(Arc::new(RelationalProperty {
             output_columns: self.columns.clone(),
             outer_columns: Default::default(),
             used_columns: self.columns.clone(),
+            orderings: vec![],
+            partition_orderings: None,
         }))
     }
 
     fn derive_physical_prop(&self, _rel_expr: &RelExpr) -> Result<PhysicalProperty> {
         Ok(PhysicalProperty {
-            distribution: Distribution::Serial,
+            distribution: Distribution::Random,
         })
     }
 
-    fn derive_cardinality(&self, _rel_expr: &RelExpr) -> Result<Arc<StatInfo>> {
+    fn derive_stats(&self, _rel_expr: &RelExpr) -> Result<Arc<StatInfo>> {
         let mut column_stats: ColumnStatSet = Default::default();
         for (index, value) in self.columns.iter().zip(self.values.iter()) {
             let (mins, _) = eval_aggr("min", vec![], &[value.clone()], self.num_rows)?;
@@ -156,7 +190,7 @@ impl Operator for ConstantTableScan {
             let (is_all_null, bitmap) = value.validity();
             let null_count = match (is_all_null, bitmap) {
                 (true, _) => self.num_rows as u64,
-                (false, Some(bitmap)) => bitmap.unset_bits() as u64,
+                (false, Some(bitmap)) => bitmap.null_count() as u64,
                 (false, None) => 0,
             };
 
@@ -190,8 +224,10 @@ impl Operator for ConstantTableScan {
         _ctx: Arc<dyn TableContext>,
         _rel_expr: &RelExpr,
         _child_index: usize,
-        required: &RequiredProperty,
+        _required: &RequiredProperty,
     ) -> Result<RequiredProperty> {
-        Ok(required.clone())
+        Err(ErrorCode::Internal(
+            "ConstantTableScan cannot compute required property for children".to_string(),
+        ))
     }
 }
