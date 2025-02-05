@@ -12,15 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_meta_app as mt;
-use common_meta_app::storage::StorageCosConfig;
-use common_meta_app::storage::StorageFsConfig;
-use common_meta_app::storage::StorageGcsConfig;
-use common_meta_app::storage::StorageObsConfig;
-use common_meta_app::storage::StorageOssConfig;
-use common_meta_app::storage::StorageS3Config;
-use common_meta_app::storage::StorageWebhdfsConfig;
-use common_protos::pb;
+use databend_common_meta_app as mt;
+use databend_common_meta_app::storage::StorageCosConfig;
+use databend_common_meta_app::storage::StorageFsConfig;
+use databend_common_meta_app::storage::StorageGcsConfig;
+use databend_common_meta_app::storage::StorageHdfsConfig;
+use databend_common_meta_app::storage::StorageObsConfig;
+use databend_common_meta_app::storage::StorageOssConfig;
+use databend_common_meta_app::storage::StorageS3Config;
+use databend_common_meta_app::storage::StorageWebhdfsConfig;
+use databend_common_protos::pb;
 
 use crate::reader_check_msg;
 use crate::FromToProto;
@@ -57,9 +58,17 @@ impl FromToProto for mt::storage::StorageParams {
             Some(pb::storage_config::Storage::Cos(s)) => Ok(mt::storage::StorageParams::Cos(
                 mt::storage::StorageCosConfig::from_pb(s)?,
             )),
-            None => Err(Incompatible {
-                reason: "StageStorage.storage cannot be None".to_string(),
-            }),
+            Some(pb::storage_config::Storage::Hdfs(s)) => Ok(mt::storage::StorageParams::Hdfs(
+                mt::storage::StorageHdfsConfig::from_pb(s)?,
+            )),
+            Some(pb::storage_config::Storage::Huggingface(s)) => {
+                Ok(mt::storage::StorageParams::Huggingface(
+                    mt::storage::StorageHuggingfaceConfig::from_pb(s)?,
+                ))
+            }
+            None => Err(Incompatible::new(
+                "StageStorage.storage cannot be None".to_string(),
+            )),
         }
     }
 
@@ -86,9 +95,16 @@ impl FromToProto for mt::storage::StorageParams {
             mt::storage::StorageParams::Cos(v) => Ok(pb::StorageConfig {
                 storage: Some(pb::storage_config::Storage::Cos(v.to_pb()?)),
             }),
-            others => Err(Incompatible {
-                reason: format!("stage type: {} not supported", others),
+            mt::storage::StorageParams::Hdfs(v) => Ok(pb::StorageConfig {
+                storage: Some(pb::storage_config::Storage::Hdfs(v.to_pb()?)),
             }),
+            mt::storage::StorageParams::Huggingface(v) => Ok(pb::StorageConfig {
+                storage: Some(pb::storage_config::Storage::Huggingface(v.to_pb()?)),
+            }),
+            others => Err(Incompatible::new(format!(
+                "stage type: {} not supported",
+                others
+            ))),
         }
     }
 }
@@ -117,7 +133,6 @@ impl FromToProto for StorageS3Config {
             enable_virtual_host_style: p.enable_virtual_host_style,
             role_arn: p.role_arn,
             external_id: p.external_id,
-            allow_anonymous: p.allow_anonymous,
         })
     }
 
@@ -137,7 +152,6 @@ impl FromToProto for StorageS3Config {
             enable_virtual_host_style: self.enable_virtual_host_style,
             role_arn: self.role_arn.clone(),
             external_id: self.external_id.clone(),
-            allow_anonymous: self.allow_anonymous,
         })
     }
 }
@@ -213,6 +227,8 @@ impl FromToProto for StorageOssConfig {
 
             access_key_id: p.access_key_id,
             access_key_secret: p.access_key_secret,
+            server_side_encryption: p.server_side_encryption,
+            server_side_encryption_key_id: p.server_side_encryption_key_id,
         })
     }
 
@@ -225,6 +241,8 @@ impl FromToProto for StorageOssConfig {
             root: self.root.clone(),
             access_key_id: self.access_key_id.clone(),
             access_key_secret: self.access_key_secret.clone(),
+            server_side_encryption: self.server_side_encryption.clone(),
+            server_side_encryption_key_id: self.server_side_encryption_key_id.clone(),
         })
     }
 }
@@ -243,6 +261,8 @@ impl FromToProto for StorageWebhdfsConfig {
             endpoint_url: p.endpoint_url,
             root: p.root,
             delegation: p.delegation,
+            disable_list_batch: p.disable_list_batch,
+            user_name: p.user_name,
         })
     }
 
@@ -253,9 +273,9 @@ impl FromToProto for StorageWebhdfsConfig {
             endpoint_url: self.endpoint_url.clone(),
             root: self.root.clone(),
             delegation: self.delegation.clone(),
+            disable_list_batch: self.disable_list_batch,
 
-            username: String::new(), // reserved for future use
-            password: String::new(), // reserved for future use
+            user_name: self.user_name.clone(),
         })
     }
 }
@@ -322,6 +342,64 @@ impl FromToProto for StorageCosConfig {
             root: self.root.clone(),
             secret_id: self.secret_id.clone(),
             secret_key: self.secret_key.clone(),
+        })
+    }
+}
+
+impl FromToProto for StorageHdfsConfig {
+    type PB = pb::HdfsStorageConfig;
+    fn get_pb_ver(p: &Self::PB) -> u64 {
+        p.version
+    }
+
+    fn from_pb(p: pb::HdfsStorageConfig) -> Result<Self, Incompatible>
+    where Self: Sized {
+        reader_check_msg(p.version, p.min_reader_ver)?;
+
+        Ok(StorageHdfsConfig {
+            root: p.root,
+            name_node: p.name_node,
+        })
+    }
+
+    fn to_pb(&self) -> Result<pb::HdfsStorageConfig, Incompatible> {
+        Ok(pb::HdfsStorageConfig {
+            version: VER,
+            min_reader_ver: MIN_READER_VER,
+            root: self.root.clone(),
+            name_node: self.name_node.clone(),
+        })
+    }
+}
+
+impl FromToProto for mt::storage::StorageHuggingfaceConfig {
+    type PB = pb::HuggingfaceStorageConfig;
+    fn get_pb_ver(p: &Self::PB) -> u64 {
+        p.version
+    }
+
+    fn from_pb(p: pb::HuggingfaceStorageConfig) -> Result<Self, Incompatible>
+    where Self: Sized {
+        reader_check_msg(p.version, p.min_reader_ver)?;
+
+        Ok(mt::storage::StorageHuggingfaceConfig {
+            repo_type: p.repo_type,
+            repo_id: p.repo_id,
+            revision: p.revision,
+            token: p.token,
+            root: p.root,
+        })
+    }
+
+    fn to_pb(&self) -> Result<pb::HuggingfaceStorageConfig, Incompatible> {
+        Ok(pb::HuggingfaceStorageConfig {
+            version: VER,
+            min_reader_ver: MIN_READER_VER,
+            repo_type: self.repo_type.clone(),
+            repo_id: self.repo_id.clone(),
+            revision: self.revision.clone(),
+            token: self.token.clone(),
+            root: self.root.clone(),
         })
     }
 }

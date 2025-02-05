@@ -14,12 +14,12 @@
 
 use std::sync::Arc;
 
-use common_catalog::table_context::TableContext;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::ComputedExpr;
-use common_expression::DataSchemaRef;
-use common_sql::parse_computed_expr;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::ComputedExpr;
+use databend_common_expression::DataSchemaRef;
+use databend_common_sql::parse_computed_expr;
 
 pub fn check_referenced_computed_columns(
     ctx: Arc<dyn TableContext>,
@@ -36,10 +36,10 @@ pub fn check_referenced_computed_columns(
                 Ok(expr) => {
                     if expr.data_type() != f.data_type() {
                         return Err(ErrorCode::ColumnReferencedByComputedColumn(format!(
-                            "expected computed column expression have type {}, but `{}` has type {}.",
+                            "expected computed column expression have type {}, but got type {}, may caused by modify column `{}`.",
                             f.data_type(),
-                            column,
                             expr.data_type(),
+                            column,
                         )));
                     }
                 }

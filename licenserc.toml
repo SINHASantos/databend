@@ -5,8 +5,6 @@ headerPath = "Apache-2.0.txt"
 excludes = [
     "scripts",
     "docker",
-    "docs",
-    "website",
     "tests",
     "tools",
     "benchmark",
@@ -14,7 +12,7 @@ excludes = [
 
     # licensed under Elastic License 2.0
     "src/binaries/query/ee_main.rs",
-    "src/binaries/meta/ee_main.rs",
+    "src/meta/binaries/meta/ee_main.rs",
     "src/meta/ee",
     "src/query/ee",
 

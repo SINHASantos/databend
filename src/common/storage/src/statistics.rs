@@ -15,11 +15,11 @@
 use std::fmt::Display;
 use std::fmt::Formatter;
 
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::types::number::NumberScalar;
-use common_expression::Scalar;
-use ordered_float::OrderedFloat;
+use databend_common_base::base::OrderedFloat;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::types::number::NumberScalar;
+use databend_common_expression::Scalar;
 
 pub type F64 = OrderedFloat<f64>;
 
@@ -47,14 +47,24 @@ impl Datum {
             Scalar::Number(NumberScalar::Float32(v)) => {
                 Some(Datum::Float(F64::from(f32::from(v) as f64)))
             }
+            Scalar::Decimal(v) => Some(Datum::Float(F64::from(v.to_float64()))),
             Scalar::Number(NumberScalar::Float64(v)) => Some(Datum::Float(v)),
-            Scalar::String(v) => Some(Datum::Bytes(v)),
+            Scalar::Binary(v) => Some(Datum::Bytes(v)),
+            Scalar::String(v) => Some(Datum::Bytes(v.as_bytes().to_vec())),
             _ => None,
         }
     }
 
     pub fn is_bytes(&self) -> bool {
         matches!(self, Datum::Bytes(_))
+    }
+
+    pub fn to_float(self) -> Self {
+        match self {
+            Datum::Int(v) => Datum::Float(F64::from(v as f64)),
+            Datum::UInt(v) => Datum::Float(F64::from(v as f64)),
+            _ => self,
+        }
     }
 
     pub fn to_double(&self) -> Result<f64> {
@@ -67,6 +77,16 @@ impl Datum {
                 "Cannot convert {:?} to double",
                 self
             ))),
+        }
+    }
+
+    pub fn to_string(&self) -> Result<String> {
+        match self {
+            Datum::Bool(v) => Ok(v.to_string()),
+            Datum::Int(v) => Ok(v.to_string()),
+            Datum::UInt(v) => Ok(v.to_string()),
+            Datum::Float(v) => Ok(v.to_string()),
+            Datum::Bytes(v) => Ok(String::from_utf8_lossy(v).to_string()),
         }
     }
 
@@ -100,7 +120,7 @@ impl Datum {
 }
 
 impl Display for Datum {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
             Datum::Bool(v) => write!(f, "{}", v),
             Datum::Int(v) => write!(f, "{}", v),

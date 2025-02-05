@@ -16,29 +16,28 @@ use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use common_catalog::table_context::TableContext;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::BlockMetaInfoDowncast;
-use common_expression::BlockThresholds;
-use common_expression::DataBlock;
-use common_pipeline_core::pipe::PipeItem;
-use common_pipeline_core::processors::port::OutputPort;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::BlockMetaInfoDowncast;
+use databend_common_expression::BlockThresholds;
+use databend_common_expression::DataBlock;
+use databend_common_pipeline_core::processors::Event;
+use databend_common_pipeline_core::processors::InputPort;
+use databend_common_pipeline_core::processors::OutputPort;
+use databend_common_pipeline_core::processors::Processor;
+use databend_common_pipeline_core::processors::ProcessorPtr;
+use databend_common_pipeline_core::PipeItem;
+use databend_storages_common_cache::CacheAccessor;
+use databend_storages_common_cache::CachedObject;
+use databend_storages_common_table_meta::meta::BlockMeta;
+use databend_storages_common_table_meta::meta::SegmentInfo;
+use databend_storages_common_table_meta::meta::Versioned;
 use log::info;
 use opendal::Operator;
-use storages_common_cache::CacheAccessor;
-use storages_common_cache_manager::CachedObject;
-use storages_common_table_meta::meta::BlockMeta;
-use storages_common_table_meta::meta::SegmentInfo;
-use storages_common_table_meta::meta::Versioned;
 
 use crate::io::TableMetaLocationGenerator;
 use crate::operations::common::MutationLogEntry;
 use crate::operations::common::MutationLogs;
-use crate::pipelines::processors::port::InputPort;
-use crate::pipelines::processors::processor::Event;
-use crate::pipelines::processors::processor::ProcessorPtr;
-use crate::pipelines::processors::Processor;
 use crate::statistics::StatisticsAccumulator;
 use crate::FuseTable;
 use crate::DEFAULT_BLOCK_PER_SEGMENT;
@@ -60,7 +59,6 @@ enum State {
 }
 
 pub struct TransformSerializeSegment {
-    ctx: Arc<dyn TableContext>,
     data_accessor: Operator,
     meta_locations: TableMetaLocationGenerator,
     accumulator: StatisticsAccumulator,
@@ -76,7 +74,6 @@ pub struct TransformSerializeSegment {
 
 impl TransformSerializeSegment {
     pub fn new(
-        ctx: Arc<dyn TableContext>,
         input: Arc<InputPort>,
         output: Arc<OutputPort>,
         table: &FuseTable,
@@ -84,7 +81,6 @@ impl TransformSerializeSegment {
     ) -> Self {
         let default_cluster_key_id = table.cluster_key_id();
         TransformSerializeSegment {
-            ctx,
             input,
             output,
             output_data: None,
@@ -164,9 +160,9 @@ impl Processor for TransformSerializeSegment {
                 .unwrap()?
                 .get_meta()
                 .cloned()
-                .ok_or(ErrorCode::Internal("No block meta. It's a bug"))?;
+                .ok_or_else(|| ErrorCode::Internal("No block meta. It's a bug"))?;
             let block_meta = BlockMeta::downcast_ref_from(&input_meta)
-                .ok_or(ErrorCode::Internal("No commit meta. It's a bug"))?
+                .ok_or_else(|| ErrorCode::Internal("No commit meta. It's a bug"))?
                 .clone();
 
             self.accumulator.add_with_block_meta(block_meta);
@@ -196,7 +192,7 @@ impl Processor for TransformSerializeSegment {
             }
             State::PreCommitSegment { location, segment } => {
                 if let Some(segment_cache) = SegmentInfo::cache() {
-                    segment_cache.put(location.clone(), Arc::new(segment.as_ref().try_into()?));
+                    segment_cache.insert(location.clone(), segment.as_ref().try_into()?);
                 }
 
                 let format_version = SegmentInfo::VERSION;
@@ -205,13 +201,11 @@ impl Processor for TransformSerializeSegment {
                 // for newly created segment, always use the latest version
                 let meta = MutationLogs {
                     entries: vec![MutationLogEntry::AppendSegment {
-                        segment_location: location.clone(),
-                        segment_info: segment,
+                        segment_location: location,
                         format_version,
+                        summary: segment.summary.clone(),
                     }],
                 };
-
-                self.ctx.add_segment_location((location, format_version))?;
 
                 self.output_data = Some(DataBlock::empty_with_meta(Box::new(meta)));
             }

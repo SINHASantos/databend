@@ -14,7 +14,8 @@
 
 //! Test StageInfo
 
-use common_meta_app as mt;
+use databend_common_meta_app as mt;
+use fastrace::func_name;
 
 use crate::common;
 use crate::user_proto_conv::test_cos_stage_info;
@@ -93,6 +94,8 @@ fn test_user_stage_webhdfs_v30() -> anyhow::Result<()> {
                 endpoint_url: "https://webhdfs.example.com".to_string(),
                 root: "/path/to/stage/files".to_string(),
                 delegation: "<delegation_token>".to_string(),
+                disable_list_batch: false,
+                user_name: String::new(),
             }),
         },
         file_format_params: mt::principal::FileFormatParams::Json(
@@ -109,6 +112,8 @@ fn test_user_stage_webhdfs_v30() -> anyhow::Result<()> {
             single: false,
             max_file_size: 0,
             disable_variant_check: false,
+            return_failed_only: false,
+            detailed_output: false,
         },
         comment: "test".to_string(),
         ..Default::default()
@@ -153,6 +158,8 @@ fn test_user_stage_fs_v22() -> anyhow::Result<()> {
             single: false,
             max_file_size: 0,
             disable_variant_check: false,
+            return_failed_only: false,
+            detailed_output: false,
         },
         comment: "test".to_string(),
         ..Default::default()
@@ -196,6 +203,8 @@ fn test_user_stage_fs_v21() -> anyhow::Result<()> {
             single: false,
             max_file_size: 0,
             disable_variant_check: false,
+            return_failed_only: false,
+            detailed_output: false,
         },
         comment: "test".to_string(),
         ..Default::default()
@@ -238,6 +247,8 @@ fn test_user_stage_fs_v20() -> anyhow::Result<()> {
             single: false,
             max_file_size: 0,
             disable_variant_check: false,
+            return_failed_only: false,
+            detailed_output: false,
         },
         comment: "test".to_string(),
         ..Default::default()
@@ -281,6 +292,8 @@ fn test_user_stage_fs_v16() -> anyhow::Result<()> {
             single: false,
             max_file_size: 0,
             disable_variant_check: false,
+            return_failed_only: false,
+            detailed_output: false,
         },
         comment: "test".to_string(),
         ..Default::default()
@@ -336,6 +349,8 @@ fn test_user_stage_s3_v16() -> anyhow::Result<()> {
             single: false,
             max_file_size: 0,
             disable_variant_check: false,
+            return_failed_only: false,
+            detailed_output: false,
         },
         comment: "test".to_string(),
         ..Default::default()
@@ -385,6 +400,8 @@ fn test_user_stage_gcs_v16() -> anyhow::Result<()> {
             single: false,
             max_file_size: 0,
             disable_variant_check: false,
+            return_failed_only: false,
+            detailed_output: false,
         },
         comment: "test".to_string(),
         ..Default::default()
@@ -417,10 +434,12 @@ fn test_user_stage_oss_v16() -> anyhow::Result<()> {
                 endpoint_url: "https://oss-cn-litang.example.com".to_string(),
                 bucket: "my_bucket".to_string(),
                 root: "/data/files".to_string(),
+                server_side_encryption: "".to_string(),
                 presign_endpoint_url: "".to_string(),
 
                 access_key_id: "access_key_id".to_string(),
                 access_key_secret: "access_key_secret".to_string(),
+                server_side_encryption_key_id: "".to_string(),
             }),
         },
         file_format_params: mt::principal::FileFormatParams::Json(
@@ -437,6 +456,8 @@ fn test_user_stage_oss_v16() -> anyhow::Result<()> {
             single: false,
             max_file_size: 0,
             disable_variant_check: false,
+            return_failed_only: false,
+            detailed_output: false,
         },
         comment: "test".to_string(),
         ..Default::default()
@@ -472,9 +493,9 @@ fn test_user_stage_oss_v13() -> anyhow::Result<()> {
                 presign_endpoint_url: "".to_string(),
                 bucket: "my_bucket".to_string(),
                 root: "/data/files".to_string(),
-
                 access_key_id: "access_key_id".to_string(),
                 access_key_secret: "access_key_secret".to_string(),
+                ..Default::default()
             }),
         },
         file_format_params: mt::principal::FileFormatParams::Json(
@@ -491,6 +512,8 @@ fn test_user_stage_oss_v13() -> anyhow::Result<()> {
             single: false,
             max_file_size: 0,
             disable_variant_check: false,
+            return_failed_only: false,
+            detailed_output: false,
         },
         comment: "test".to_string(),
         ..Default::default()
@@ -545,6 +568,8 @@ fn test_user_stage_s3_v11() -> anyhow::Result<()> {
             single: false,
             max_file_size: 0,
             disable_variant_check: false,
+            return_failed_only: false,
+            detailed_output: false,
         },
         comment: "test".to_string(),
         ..Default::default()
@@ -597,6 +622,8 @@ fn test_user_stage_s3_v8() -> anyhow::Result<()> {
             single: false,
             max_file_size: 0,
             disable_variant_check: false,
+            return_failed_only: false,
+            detailed_output: false,
         },
         comment: "test".to_string(),
         ..Default::default()
@@ -640,6 +667,8 @@ fn test_user_stage_fs_v6() -> anyhow::Result<()> {
             single: false,
             max_file_size: 0,
             disable_variant_check: false,
+            return_failed_only: false,
+            detailed_output: false,
         },
         comment: "test".to_string(),
         ..Default::default()
@@ -693,6 +722,8 @@ fn test_user_stage_s3_v6() -> anyhow::Result<()> {
             single: false,
             max_file_size: 0,
             disable_variant_check: false,
+            return_failed_only: false,
+            detailed_output: false,
         },
         comment: "test".to_string(),
         ..Default::default()
@@ -742,6 +773,8 @@ fn test_user_stage_gcs_v6() -> anyhow::Result<()> {
             single: false,
             max_file_size: 0,
             disable_variant_check: false,
+            return_failed_only: false,
+            detailed_output: false,
         },
         comment: "test".to_string(),
         ..Default::default()
@@ -784,6 +817,8 @@ fn test_user_stage_fs_v4() -> anyhow::Result<()> {
             single: false,
             max_file_size: 0,
             disable_variant_check: false,
+            return_failed_only: false,
+            detailed_output: false,
         },
         comment: "test".to_string(),
         ..Default::default()
@@ -837,6 +872,8 @@ fn test_user_stage_s3_v4() -> anyhow::Result<()> {
             single: false,
             max_file_size: 0,
             disable_variant_check: false,
+            return_failed_only: false,
+            detailed_output: false,
         },
         comment: "test".to_string(),
         ..Default::default()
@@ -885,6 +922,8 @@ fn test_user_stage_gcs_v4() -> anyhow::Result<()> {
             single: false,
             max_file_size: 0,
             disable_variant_check: false,
+            return_failed_only: false,
+            detailed_output: false,
         },
         comment: "test".to_string(),
         ..Default::default()
@@ -935,6 +974,8 @@ fn test_user_stage_s3_v1() -> anyhow::Result<()> {
             single: false,
             max_file_size: 0,
             disable_variant_check: false,
+            return_failed_only: false,
+            detailed_output: false,
         },
         comment: "test".to_string(),
         ..Default::default()
@@ -980,6 +1021,8 @@ fn test_internal_stage_v17() -> anyhow::Result<()> {
             single: false,
             max_file_size: 0,
             disable_variant_check: false,
+            return_failed_only: false,
+            detailed_output: false,
         },
         comment: "test".to_string(),
         ..Default::default()
@@ -1024,6 +1067,8 @@ fn test_user_stage_v19() -> anyhow::Result<()> {
             single: false,
             max_file_size: 0,
             disable_variant_check: false,
+            return_failed_only: false,
+            detailed_output: false,
         },
         comment: "test".to_string(),
         ..Default::default()

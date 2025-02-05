@@ -16,7 +16,6 @@ mod meta;
 mod mutator;
 mod processors;
 
-pub use processors::BroadcastProcessor;
-pub use processors::MergeIntoOperationAggregator;
-pub use processors::ReplaceIntoProcessor;
-pub use processors::UnbranchedReplaceIntoProcessor;
+pub use meta::*;
+pub use mutator::*;
+pub use processors::*;

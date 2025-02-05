@@ -14,12 +14,12 @@
 
 use std::sync::Arc;
 
-use common_exception::Result;
-use common_expression::DataBlock;
-use common_pipeline_core::pipe::PipeItem;
-use common_pipeline_core::processors::port::InputPort;
-use common_pipeline_core::processors::port::OutputPort;
-use common_pipeline_core::processors::processor::ProcessorPtr;
+use databend_common_exception::Result;
+use databend_common_expression::DataBlock;
+use databend_common_pipeline_core::processors::InputPort;
+use databend_common_pipeline_core::processors::OutputPort;
+use databend_common_pipeline_core::processors::ProcessorPtr;
+use databend_common_pipeline_core::PipeItem;
 
 use crate::processors::transforms::Transform;
 use crate::processors::transforms::Transformer;
@@ -27,7 +27,6 @@ use crate::processors::transforms::Transformer;
 pub struct TransformDummy;
 
 impl TransformDummy {
-    #[allow(dead_code)]
     pub fn create(input: Arc<InputPort>, output: Arc<OutputPort>) -> ProcessorPtr {
         ProcessorPtr::create(Transformer::create(input, output, TransformDummy {}))
     }

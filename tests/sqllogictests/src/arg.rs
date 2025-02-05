@@ -1,4 +1,4 @@
-// Copyright 2021 Datafuse Labs.
+// Copyright 2021 Datafuse Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -55,7 +55,7 @@ pub struct SqlLogicTestArgs {
         long = "handlers",
         use_value_delimiter = true,
         value_delimiter = ',',
-        help = "Choose handlers to run tests, support mysql, http, clickhouse handler, the arg is optional. If use multiple handlers, please use \',\' to split them"
+        help = "Choose handlers to run tests, support mysql, http handler, the arg is optional. If use multiple handlers, please use \',\' to split them"
     )]
     pub handlers: Option<Vec<String>>,
 
@@ -121,4 +121,11 @@ pub struct SqlLogicTestArgs {
         help = "Specify the database to connnect, the default database is 'default'"
     )]
     pub database: String,
+
+    #[arg(
+        long = "port",
+        default_value = "8000",
+        help = "The databend server http port"
+    )]
+    pub port: u16,
 }

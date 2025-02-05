@@ -15,50 +15,42 @@
 use std::cmp;
 use std::sync::Arc;
 
-use common_exception::Result;
+use databend_common_exception::Result;
 
+use crate::optimizer::extract::Matcher;
 use crate::optimizer::rule::Rule;
 use crate::optimizer::rule::TransformResult;
 use crate::optimizer::RuleID;
 use crate::optimizer::SExpr;
 use crate::plans::Limit;
-use crate::plans::PatternPlan;
 use crate::plans::RelOp;
 use crate::plans::RelOperator;
 use crate::plans::Scan;
 
 /// Input:  Limit
 ///           \
-///          LogicalGet
+///          Scan
 ///
 /// Output:
 ///         Limit
 ///           \
-///           LogicalGet(padding limit)
-
+///           Scan(padding limit)
 pub struct RulePushDownLimitScan {
     id: RuleID,
-    patterns: Vec<SExpr>,
+    matchers: Vec<Matcher>,
 }
 
 impl RulePushDownLimitScan {
     pub fn new() -> Self {
         Self {
             id: RuleID::PushDownLimitScan,
-            patterns: vec![SExpr::create_unary(
-                Arc::new(
-                    PatternPlan {
-                        plan_type: RelOp::Limit,
-                    }
-                    .into(),
-                ),
-                Arc::new(SExpr::create_leaf(Arc::new(
-                    PatternPlan {
-                        plan_type: RelOp::Scan,
-                    }
-                    .into(),
-                ))),
-            )],
+            matchers: vec![Matcher::MatchOp {
+                op_type: RelOp::Limit,
+                children: vec![Matcher::MatchOp {
+                    op_type: RelOp::Scan,
+                    children: vec![],
+                }],
+            }],
         }
     }
 }
@@ -70,21 +62,23 @@ impl Rule for RulePushDownLimitScan {
 
     fn apply(&self, s_expr: &SExpr, state: &mut TransformResult) -> Result<()> {
         let limit: Limit = s_expr.plan().clone().try_into()?;
-        if let Some(mut count) = limit.limit {
-            let child = s_expr.child(0)?;
-            let mut get: Scan = child.plan().clone().try_into()?;
-            count += limit.offset;
-            get.limit = Some(get.limit.map_or(count, |c| cmp::max(c, count)));
-            let get = SExpr::create_leaf(Arc::new(RelOperator::Scan(get)));
+        let Some(mut count) = limit.limit else {
+            return Ok(());
+        };
+        count += limit.offset;
 
-            let mut result = s_expr.replace_children(vec![Arc::new(get)]);
-            result.set_applied_rule(&self.id);
-            state.add_result(result);
-        }
+        let child = s_expr.child(0)?;
+        let mut get: Scan = child.plan().clone().try_into()?;
+        get.limit = Some(get.limit.map_or(count, |c| cmp::max(c, count)));
+        let get = SExpr::create_leaf(Arc::new(RelOperator::Scan(get)));
+
+        let mut result = s_expr.replace_children(vec![Arc::new(get)]);
+        result.set_applied_rule(&self.id);
+        state.add_result(result);
         Ok(())
     }
 
-    fn patterns(&self) -> &Vec<SExpr> {
-        &self.patterns
+    fn matchers(&self) -> &[Matcher] {
+        &self.matchers
     }
 }

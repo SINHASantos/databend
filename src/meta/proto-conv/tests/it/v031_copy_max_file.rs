@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_meta_app as mt;
-use common_meta_app::storage::StorageParams;
-use common_meta_app::storage::StorageWebhdfsConfig;
+use databend_common_meta_app as mt;
+use databend_common_meta_app::storage::StorageParams;
+use databend_common_meta_app::storage::StorageWebhdfsConfig;
+use fastrace::func_name;
 
 use crate::common;
 
@@ -50,6 +51,8 @@ fn test_decode_v31_copy_max_file() -> anyhow::Result<()> {
                 endpoint_url: "https://webhdfs.example.com".to_string(),
                 root: "/path/to/stage/files".to_string(),
                 delegation: "<delegation_token>".to_string(),
+                disable_list_batch: false,
+                user_name: String::new(),
             }),
         },
         file_format_params: mt::principal::FileFormatParams::Json(
@@ -66,6 +69,8 @@ fn test_decode_v31_copy_max_file() -> anyhow::Result<()> {
             single: false,
             max_file_size: 0,
             disable_variant_check: false,
+            return_failed_only: false,
+            detailed_output: false,
         },
         comment: "test".to_string(),
         ..Default::default()

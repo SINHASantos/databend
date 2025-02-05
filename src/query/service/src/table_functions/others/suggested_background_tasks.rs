@@ -15,46 +15,41 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
-use background_service::Suggestion;
-use chrono::NaiveDateTime;
-use chrono::TimeZone;
-use chrono::Utc;
-use common_catalog::plan::DataSourcePlan;
-use common_catalog::plan::PartStatistics;
-use common_catalog::plan::Partitions;
-use common_catalog::plan::PushDownInfo;
-use common_catalog::table_args::TableArgs;
-use common_catalog::table_context::TableContext;
-use common_catalog::table_function::TableFunction;
-use common_exception::ErrorCode;
-use common_exception::Result;
-use common_expression::types::BooleanType;
-use common_expression::types::StringType;
-use common_expression::types::VariantType;
-use common_expression::DataBlock;
-use common_expression::FromData;
-use common_expression::FromOptData;
-use common_expression::TableDataType;
-use common_expression::TableField;
-use common_expression::TableSchemaRef;
-use common_expression::TableSchemaRefExt;
-use common_license::license::Feature;
-use common_license::license_manager::get_license_manager;
-use common_meta_app::schema::TableIdent;
-use common_meta_app::schema::TableInfo;
-use common_meta_app::schema::TableMeta;
-use common_pipeline_core::processors::port::OutputPort;
-use common_pipeline_core::processors::processor::ProcessorPtr;
-use common_pipeline_core::Pipeline;
-use common_pipeline_sources::AsyncSource;
-use common_pipeline_sources::AsyncSourcer;
-use common_sql::Planner;
-use common_storages_factory::Table;
+use chrono::DateTime;
+use databend_common_catalog::plan::DataSourcePlan;
+use databend_common_catalog::plan::PartStatistics;
+use databend_common_catalog::plan::Partitions;
+use databend_common_catalog::plan::PushDownInfo;
+use databend_common_catalog::table_args::TableArgs;
+use databend_common_catalog::table_context::TableContext;
+use databend_common_catalog::table_function::TableFunction;
+use databend_common_exception::Result;
+use databend_common_expression::types::BooleanType;
+use databend_common_expression::types::StringType;
+use databend_common_expression::types::VariantType;
+use databend_common_expression::DataBlock;
+use databend_common_expression::FromData;
+use databend_common_expression::TableDataType;
+use databend_common_expression::TableField;
+use databend_common_expression::TableSchemaRef;
+use databend_common_expression::TableSchemaRefExt;
+use databend_common_license::license::Feature;
+use databend_common_license::license_manager::LicenseManagerSwitch;
+use databend_common_meta_app::schema::TableIdent;
+use databend_common_meta_app::schema::TableInfo;
+use databend_common_meta_app::schema::TableMeta;
+use databend_common_pipeline_core::processors::OutputPort;
+use databend_common_pipeline_core::processors::ProcessorPtr;
+use databend_common_pipeline_core::Pipeline;
+use databend_common_pipeline_sources::AsyncSource;
+use databend_common_pipeline_sources::AsyncSourcer;
+use databend_common_storages_factory::Table;
+use databend_enterprise_background_service::Suggestion;
 use futures_util::StreamExt;
 use log::error;
 use log::info;
 
+use crate::interpreters::interpreter_plan_sql;
 use crate::interpreters::InterpreterFactory;
 use crate::sessions::QueryContext;
 
@@ -83,16 +78,14 @@ impl SuggestedBackgroundTasksTable {
         let table_info = TableInfo {
             ident: TableIdent::new(table_id, 0),
             desc: format!("'{}'.'{}'", database_name, table_func_name),
-            name: String::from("license_info"),
+            name: String::from("suggested_background_tasks"),
             meta: TableMeta {
                 schema: Self::schema(),
                 engine: String::from(table_func_name),
                 // Assuming that created_on is unnecessary for function table,
                 // we could make created_on fixed to pass test_shuffle_action_try_into.
-                created_on: Utc
-                    .from_utc_datetime(&NaiveDateTime::from_timestamp_opt(0, 0).unwrap()),
-                updated_on: Utc
-                    .from_utc_datetime(&NaiveDateTime::from_timestamp_opt(0, 0).unwrap()),
+                created_on: DateTime::from_timestamp(0, 0).unwrap(),
+                updated_on: DateTime::from_timestamp(0, 0).unwrap(),
                 ..Default::default()
             },
             ..Default::default()
@@ -104,10 +97,6 @@ impl SuggestedBackgroundTasksTable {
 
 #[async_trait::async_trait]
 impl Table for SuggestedBackgroundTasksTable {
-    fn is_local(&self) -> bool {
-        true
-    }
-
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -136,6 +125,7 @@ impl Table for SuggestedBackgroundTasksTable {
         ctx: Arc<dyn TableContext>,
         _plan: &DataSourcePlan,
         pipeline: &mut Pipeline,
+        _put_cache: bool,
     ) -> Result<()> {
         pipeline.add_source(
             |output| SuggestedBackgroundTasksSource::create(ctx.clone(), output),
@@ -159,14 +149,10 @@ impl SuggestedBackgroundTasksSource {
     }
 
     #[async_backtrace::framed]
-    pub async fn do_execute_sql(
-        ctx: Arc<QueryContext>,
-        sql: String,
-    ) -> Result<Option<RecordBatch>> {
-        let mut planner = Planner::new(ctx.clone());
-        let (plan, plan_extras) = planner.plan_sql(sql.as_str()).await?;
-        ctx.attach_query_str(plan.to_string(), plan_extras.statement.to_mask_sql());
-        let data_schema = plan.schema();
+    pub async fn do_execute_sql(ctx: Arc<QueryContext>, sql: String) -> Result<Option<DataBlock>> {
+        // Use interpreter_plan_sql, we can write the query log if an error occurs.
+        let (plan, _, _) = interpreter_plan_sql(ctx.clone(), sql.as_str(), false).await?;
+
         let interpreter = InterpreterFactory::get(ctx.clone(), &plan).await?;
         let stream = interpreter.execute(ctx.clone()).await?;
         let blocks = stream.map(|v| v).collect::<Vec<_>>().await;
@@ -186,9 +172,6 @@ impl SuggestedBackgroundTasksSource {
             return Ok(None);
         }
         let record = DataBlock::concat(&result)?;
-        let record = record
-            .to_record_batch(data_schema.as_ref())
-            .map_err(|e| ErrorCode::Internal(format!("{e:?}")))?;
         Ok(Some(record))
     }
 
@@ -197,8 +180,8 @@ impl SuggestedBackgroundTasksSource {
         let ctx = ctx.clone();
         info!(
             background = true,
-            tenant = ctx.get_tenant();
-            "list all lsuggestions"
+            tenant = ctx.get_tenant().tenant_name().to_string();
+            "list all suggestions"
         );
         Self::get_suggested_compaction_tasks(ctx).await
     }
@@ -220,11 +203,11 @@ impl SuggestedBackgroundTasksSource {
                     table_stats,
                     ..
                 } => {
-                    suggestion_type.push("compaction".to_string().into_bytes().to_vec());
+                    suggestion_type.push("compaction".to_string());
                     should_do_segment_compact.push(Some(need_compact_segment));
                     should_do_compact.push(Some(need_compact_block));
-                    database_name.push(db_name.into_bytes().to_vec());
-                    table_names.push(table_name.into_bytes().to_vec());
+                    database_name.push(db_name);
+                    table_names.push(table_name);
                     table_statistics.push(serde_json::to_vec(&table_stats).unwrap());
                 }
             }
@@ -242,9 +225,8 @@ impl SuggestedBackgroundTasksSource {
 
 #[async_trait::async_trait]
 impl AsyncSource for SuggestedBackgroundTasksSource {
-    const NAME: &'static str = "license_info";
+    const NAME: &'static str = "suggested_background_tasks";
 
-    #[async_trait::unboxed_simple]
     #[async_backtrace::framed]
     async fn generate(&mut self) -> Result<Option<DataBlock>> {
         if self.done {
@@ -253,14 +235,11 @@ impl AsyncSource for SuggestedBackgroundTasksSource {
         self.done = true;
 
         let ctx = self.ctx.as_any().downcast_ref::<QueryContext>().unwrap();
-        let license_mgr = get_license_manager();
-        license_mgr.manager.check_enterprise_enabled(
-            &ctx.get_settings(),
-            ctx.get_tenant(),
-            Feature::BackgroundService,
-        )?;
+        LicenseManagerSwitch::instance()
+            .check_enterprise_enabled(ctx.get_license_key(), Feature::BackgroundService)?;
 
-        let suggestions = Self::all_suggestions(Arc::new(ctx.clone())).await?;
+        let ctx = QueryContext::create_from(ctx);
+        let suggestions = Self::all_suggestions(ctx).await?;
         Ok(Some(self.to_block(suggestions)?))
     }
 }

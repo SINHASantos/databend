@@ -14,8 +14,9 @@
 
 use std::collections::HashMap;
 
-use common_expression::Expr;
-use log::info;
+use databend_common_expression::Expr;
+use databend_common_functions::BUILTIN_FUNCTIONS;
+use log::debug;
 
 use super::BlockOperator;
 use crate::optimizer::ColumnSet;
@@ -36,10 +37,10 @@ pub fn apply_cse(
                     count_expressions(expr, &mut cse_counter);
                 }
 
-                let mut cse_candidates: Vec<Expr> = cse_counter
+                let mut cse_candidates: Vec<&Expr> = cse_counter
                     .iter()
                     .filter(|(_, count)| **count > 1)
-                    .map(|(expr, _)| expr.clone())
+                    .map(|(expr, _)| expr)
                     .collect();
 
                 // Make sure the smaller expr goes firstly
@@ -51,7 +52,7 @@ pub fn apply_cse(
                     let mut cse_replacements = HashMap::new();
 
                     let candidates_nums = cse_candidates.len();
-                    for cse_candidate in &cse_candidates {
+                    for cse_candidate in cse_candidates.iter() {
                         let temp_var = format!("__temp_cse_{}", temp_var_counter);
                         let temp_expr = Expr::ColumnRef {
                             span: None,
@@ -60,10 +61,10 @@ pub fn apply_cse(
                             display_name: temp_var.clone(),
                         };
 
-                        let mut expr_cloned = cse_candidate.clone();
+                        let mut expr_cloned = (*cse_candidate).clone();
                         perform_cse_replacement(&mut expr_cloned, &cse_replacements);
 
-                        info!(
+                        debug!(
                             "cse_candidate: {}, temp_expr: {}",
                             expr_cloned.sql_display(),
                             temp_expr.sql_display()
@@ -74,36 +75,31 @@ pub fn apply_cse(
                         temp_var_counter += 1;
                     }
 
-                    let mut new_projections: Option<ColumnSet> =
-                        projections.as_ref().map(|projections| {
-                            projections
-                                .iter()
-                                .filter(|idx| **idx < input_num_columns)
-                                .copied()
-                                .collect::<ColumnSet>()
-                        });
+                    let projections = projections
+                        .unwrap_or((0..input_num_columns + exprs.len()).collect::<ColumnSet>());
 
-                    let has_projections = new_projections.is_some();
+                    // Regenerate the projections based on the replacements
+                    // 1. Initialize the new_projections with the original projections with unchanged indexes
+                    let mut new_projections = projections
+                        .iter()
+                        .filter(|idx| **idx < input_num_columns)
+                        .copied()
+                        .collect::<ColumnSet>();
+
                     for mut expr in exprs {
                         perform_cse_replacement(&mut expr, &cse_replacements);
                         new_exprs.push(expr);
 
-                        if has_projections {
-                            // Safe to unwrap().
-                            if projections
-                                .as_ref()
-                                .unwrap()
-                                .contains(&(temp_var_counter - candidates_nums))
-                            {
-                                new_projections.as_mut().unwrap().insert(temp_var_counter);
-                            }
+                        // 2. Increment projection index because the position is occupied by the cse
+                        if projections.contains(&(temp_var_counter - candidates_nums)) {
+                            new_projections.insert(temp_var_counter);
                         }
                         temp_var_counter += 1;
                     }
 
                     results.push(BlockOperator::Map {
                         exprs: new_exprs,
-                        projections: new_projections,
+                        projections: Some(new_projections),
                     });
                 } else {
                     results.push(BlockOperator::Map { exprs, projections });
@@ -113,7 +109,6 @@ pub fn apply_cse(
                 input_num_columns = projection.len();
                 results.push(BlockOperator::Project { projection });
             }
-            _ => results.push(op),
         }
     }
 
@@ -123,8 +118,13 @@ pub fn apply_cse(
 /// `count_expressions` recursively counts the occurrences of expressions in an expression tree
 /// and stores the count in a HashMap.
 fn count_expressions(expr: &Expr, counter: &mut HashMap<Expr, usize>) {
+    if !expr.is_deterministic(&BUILTIN_FUNCTIONS) {
+        return;
+    }
     match expr {
-        Expr::FunctionCall { args, .. } => {
+        Expr::FunctionCall { function, .. } if function.signature.name == "if" => {}
+        Expr::FunctionCall { function, .. } if function.signature.name == "is_not_error" => {}
+        Expr::FunctionCall { args, .. } | Expr::LambdaFunctionCall { args, .. } => {
             let entry = counter.entry(expr.clone()).or_insert(0);
             *entry += 1;
 
@@ -160,7 +160,7 @@ fn perform_cse_replacement(expr: &mut Expr, cse_replacements: &HashMap<String, E
         } => {
             perform_cse_replacement(inner_expr.as_mut(), cse_replacements);
         }
-        Expr::FunctionCall { args, .. } => {
+        Expr::FunctionCall { args, .. } | Expr::LambdaFunctionCall { args, .. } => {
             for arg in args.iter_mut() {
                 perform_cse_replacement(arg, cse_replacements);
             }
